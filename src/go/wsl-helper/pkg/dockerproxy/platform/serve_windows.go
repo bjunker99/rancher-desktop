@@ -101,6 +101,17 @@ func ParseBindString(input string) (string, string, string, bool) {
 	// Luckily, we only have Linux dockerd, so we only have to worry about
 	// Windows-style paths (that may contain colons) in the first part.
 
+	if isWSLPath(input) {
+		firstIndex := strings.Index(input, ":")
+		lastIndex := strings.LastIndex(input, ":")
+		if firstIndex == lastIndex {
+			return input[:firstIndex], input[firstIndex+1:], "", true
+		} else {
+			rest := input[firstIndex+1:]
+			middleIndex := strings.Index(rest, ":")
+			return input[:firstIndex], rest[:middleIndex], rest[middleIndex+1:], true
+		}
+	}
 	// pathPattern is a RE for the first two options above.
 	pathPattern := regexp.MustCompile(`^(?:\\\\\?\\)?.:[^:]*`)
 	match := pathPattern.FindString(input)
@@ -123,6 +134,19 @@ func ParseBindString(input string) (string, string, string, bool) {
 	}
 }
 
+func isWSLPath(input string) bool {
+	if len(input) >= 3 && input[0] == '/' && input[2] == '/' {
+		// /c/
+		return true
+	}
+	if len(input) >= 2 && input[1] == '/' {
+		// c/
+		return true
+	}
+
+	return false
+}
+
 func isSlash(input string, indices ...int) bool {
 	for _, i := range indices {
 		if len(input) <= i || (input[i] != '/' && input[i] != '\\') {
@@ -141,12 +165,18 @@ func IsAbsolutePath(input string) bool {
 		// \\?\C:\
 		return true
 	}
+	return isWSLPath(input)
 	return false
 }
 
 // TranslatePathFromClient converts a client path to a path that can be used by
 // the docker daemon.
 func TranslatePathFromClient(windowsPath string) (string, error) {
+	if isWSLPath(windowsPath) {
+		trimmedLeft := strings.TrimLeft(windowsPath, "/")
+		modifiedPath := fmt.Sprintf("/mnt/%s", trimmedLeft)
+		return strings.TrimSpace(string(modifiedPath)), nil
+	}
 	// TODO: See if we can do something faster than shelling out.
 	cmd := exec.Command("wsl", "--distribution", "rancher-desktop", "--exec", "/bin/wslpath", "-a", "-u", windowsPath)
 	output, err := cmd.Output()
