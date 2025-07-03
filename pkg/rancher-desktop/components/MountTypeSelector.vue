@@ -55,7 +55,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
             label:           this.t(`virtualMachine.mount.type.options.${ x }.label`),
             value:           x,
             description:     this.t(`virtualMachine.mount.type.options.${ x }.description`, {}, true),
-            experimental:    x !== defaultOption, // Mark experimental options
+            experimental:    x === MountType.NINEP,
             disabled:        x === MountType.VIRTIOFS && this.virtIoFsDisabled,
             compatiblePrefs: this.getCompatiblePrefs(x),
           };
@@ -65,7 +65,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       return 'mountType';
     },
     ninePSelected(): boolean {
-      return this.preferences.experimental.virtualMachine.mount.type === MountType.NINEP;
+      return this.preferences.virtualMachine.mount.type === MountType.NINEP;
     },
     virtIoFsDisabled(): boolean {
       // virtiofs should only be disabled on macOS WITHOUT the possibility to select the VM type VZ. VZ doesn't need to
@@ -124,13 +124,17 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       if (os.platform() === 'darwin') {
         switch (mountType) {
         case MountType.NINEP:
-          if (this.preferences.experimental.virtualMachine.type === VMType.VZ) {
-            compatiblePrefs.push( { prefName: VMType.QEMU, tabName: 'emulation' } );
+          if (this.preferences.virtualMachine.type === VMType.VZ) {
+            compatiblePrefs.push( {
+              title: VMType.QEMU, navItemName: 'Virtual Machine', tabName: 'emulation',
+            } );
           }
           break;
         case MountType.VIRTIOFS:
-          if (this.preferences.experimental.virtualMachine.type === VMType.QEMU) {
-            compatiblePrefs.push( { prefName: VMType.VZ, tabName: 'emulation' } );
+          if (this.preferences.virtualMachine.type === VMType.QEMU) {
+            compatiblePrefs.push( {
+              title: VMType.VZ, navItemName: 'Virtual Machine', tabName: 'emulation',
+            } );
           }
           break;
         }
@@ -149,7 +153,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         <rd-fieldset
           data-test="mountType"
           :legend-text="t('virtualMachine.mount.type.legend')"
-          :is-locked="isPreferenceLocked('experimental.virtualMachine.mount.type')"
+          :is-locked="isPreferenceLocked('virtualMachine.mount.type')"
         >
           <template #default="{ isLocked }">
             <radio-group
@@ -166,11 +170,11 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
                   :key="groupName+'-'+index"
                   v-tooltip="disabledVirtIoFsTooltip(option.disabled)"
                   :name="groupName"
-                  :value="preferences.experimental.virtualMachine.mount.type"
+                  :value="preferences.virtualMachine.mount.type"
                   :val="option.value"
                   :disabled="option.disabled || isDisabled"
                   :data-test="option.label"
-                  @input="updateValue('experimental.virtualMachine.mount.type', $event)"
+                  @input="updateValue('virtualMachine.mount.type', $event)"
                 >
                   <template #label>
                     {{ option.label }}
@@ -181,9 +185,8 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
                   <template #description>
                     {{ option.description }}
                     <incompatible-preferences-alert
-                      v-if="option.value === preferences.experimental.virtualMachine.mount.type"
+                      v-if="option.value === preferences.virtualMachine.mount.type"
                       :compatible-prefs="option.compatiblePrefs"
-                      @update:tab="$emit('update:tab', $event)"
                     />
                   </template>
                 </radio-button>

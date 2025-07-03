@@ -1,6 +1,5 @@
 <script lang="ts">
 import { Banner } from '@rancher/components';
-import dayjs from 'dayjs';
 import isEmpty from 'lodash/isEmpty';
 import Vue from 'vue';
 import { mapGetters } from 'vuex';
@@ -9,6 +8,7 @@ import EmptyState from '@pkg/components/EmptyState.vue';
 import SnapshotCard from '@pkg/components/SnapshotCard.vue';
 import { Snapshot, SnapshotEvent } from '@pkg/main/snapshots/types';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { escapeHtml } from '@pkg/utils/string';
 
 interface Data {
   snapshotEvent: SnapshotEvent | null;
@@ -18,7 +18,7 @@ interface Data {
 
 interface Methods {
   pollingStart: () => void,
-  currentTime: () => string,
+  escapeHtml: (name: string|undefined) => string,
 }
 
 interface Computed {
@@ -60,10 +60,12 @@ export default Vue.extend<Data, Methods, Computed, never>({
       return;
     }
 
-    const { type, result, snapshotName } = this.$route.params as SnapshotEvent;
+    const {
+      type, result, snapshotName, eventTime,
+    } = this.$route.params as SnapshotEvent;
 
     this.snapshotEvent = {
-      type, result, snapshotName,
+      type, result, snapshotName, eventTime,
     };
   },
 
@@ -80,11 +82,7 @@ export default Vue.extend<Data, Methods, Computed, never>({
         this.$store.dispatch('snapshots/fetch');
       }, 1500);
     },
-    currentTime() {
-      const date = dayjs(Date.now());
-
-      return date.format('YYYY-MM-DD HH:mm');
-    },
+    escapeHtml,
   },
 });
 </script>
@@ -102,11 +100,12 @@ export default Vue.extend<Data, Methods, Computed, never>({
         @close="snapshotEvent=null"
       >
         <span
-          v-clean-html="t(`snapshots.info.${ snapshotEvent.type }.${ snapshotEvent.result }`, { snapshot: snapshotEvent.snapshotName, error: snapshotEvent.error }, true)"
+          v-clean-html="t(`snapshots.info.${ snapshotEvent.type }.${ snapshotEvent.result }`,
+                          { snapshot: escapeHtml(snapshotEvent.snapshotName), error: snapshotEvent.error }, true)"
           class="event-message"
         />
         <span
-          v-clean-html="t('snapshots.info.when', { time: currentTime() })"
+          v-clean-html="t('snapshots.info.when', { time: snapshotEvent.eventTime })"
           class="event-message"
         />
       </Banner>

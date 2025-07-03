@@ -1,17 +1,24 @@
 package factoryreset
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/autostart"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
-	"github.com/sirupsen/logrus"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/process"
 )
 
-func DeleteData(appPaths paths.Paths, removeKubernetesCache bool) error {
-	if err := autostart.EnsureAutostart(false); err != nil {
+func DeleteData(ctx context.Context, appPaths *paths.Paths, removeKubernetesCache bool) error {
+	if err := autostart.EnsureAutostart(ctx, false); err != nil {
 		logrus.Errorf("Failed to remove autostart configuration: %s", err)
+	}
+
+	if err := process.TerminateProcessInDirectory(appPaths.ExtensionRoot, false); err != nil {
+		logrus.Errorf("Failed to stop extension processes, ignoring: %s", err)
 	}
 
 	pathList := []string{
@@ -19,6 +26,7 @@ func DeleteData(appPaths paths.Paths, removeKubernetesCache bool) error {
 		appPaths.Config,
 		appPaths.Logs,
 		appPaths.ExtensionRoot,
+		appPaths.OldUserData,
 	}
 	pathList = append(pathList, appHomeDirectories(appPaths)...)
 

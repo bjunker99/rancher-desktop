@@ -9,7 +9,7 @@ import semver from 'semver';
 import { NavPage } from './pages/nav-page';
 import { getAlternateSetting, startSlowerDesktop, teardown } from './utils/TestUtils';
 
-import { Settings, ContainerEngine } from '@pkg/config/settings';
+import { Settings, ContainerEngine, VMType } from '@pkg/config/settings';
 import fetch from '@pkg/utils/fetch';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial, RecursiveKeys } from '@pkg/utils/typeUtils';
@@ -20,14 +20,11 @@ test.describe.serial('KubernetesBackend', () => {
   let electronApp: ElectronApplication;
   let page: Page;
 
-  test.beforeAll(async() => {
-    const result = await startSlowerDesktop(__filename);
-
-    electronApp = result[0] as ElectronApplication;
-    page = result[1] as Page;
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    [electronApp, page] = await startSlowerDesktop(testInfo);
   });
 
-  test.afterAll(() => teardown(electronApp, __filename));
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should start loading the background services and hide progress bar', async() => {
     const navPage = new NavPage(page);
@@ -93,7 +90,7 @@ test.describe.serial('KubernetesBackend', () => {
         // The Kubernetes version could be empty if it's previously disabled.
         // Set something.
         const updatedSettings: RecursivePartial<Settings> = {
-          kubernetes: { version: '1.23.4' },
+          kubernetes: { version: '1.29.4' },
           version:    10 as Settings['version'],
         };
 
@@ -103,7 +100,7 @@ test.describe.serial('KubernetesBackend', () => {
       const newSettings: RecursivePartial<Settings> = {
         containerEngine: { name: getAlternateSetting(currentSettings, 'containerEngine.name', ContainerEngine.CONTAINERD, ContainerEngine.MOBY) },
         kubernetes:      {
-          version: getAlternateSetting(currentSettings, 'kubernetes.version', '1.23.6', '1.23.5'),
+          version: getAlternateSetting(currentSettings, 'kubernetes.version', '1.29.6', '1.29.5'),
           port:    getAlternateSetting(currentSettings, 'kubernetes.port', 6443, 6444),
           enabled: getAlternateSetting(currentSettings, 'kubernetes.enabled', true, false),
           options: {
@@ -114,8 +111,8 @@ test.describe.serial('KubernetesBackend', () => {
       };
       /** Platform-specific changes to `newSettings`. */
       const platformSettings: Partial<Record<NodeJS.Platform, RecursivePartial<Settings>>> = {
-        win32:  { virtualMachine: { hostResolver: getAlternateSetting(currentSettings, 'virtualMachine.hostResolver', true, false) } },
-        darwin: { experimental: { virtualMachine: { socketVMNet: getAlternateSetting(currentSettings, 'experimental.virtualMachine.socketVMNet', true, false) } } },
+        win32:  { kubernetes: { ingress: { localhostOnly: getAlternateSetting(currentSettings, 'kubernetes.ingress.localhostOnly', true, false) } } },
+        darwin: { virtualMachine: { type: getAlternateSetting(currentSettings, 'virtualMachine.type', VMType.VZ, VMType.QEMU) } },
       };
 
       _.merge(newSettings, platformSettings[process.platform] ?? {});
@@ -147,8 +144,8 @@ test.describe.serial('KubernetesBackend', () => {
 
       /** Platform-specific additions to `expectedDefinition`. */
       const platformExpectedDefinitions: Partial<Record<NodeJS.Platform, ExpectedDefinition>> = {
-        win32:  { 'virtualMachine.hostResolver': false },
-        darwin: { 'experimental.virtualMachine.socketVMNet': false },
+        win32:  { 'kubernetes.ingress.localhostOnly': false },
+        darwin: { 'virtualMachine.type': false },
       };
 
       _.merge(expectedDefinition, platformExpectedDefinitions[process.platform] ?? {});
@@ -158,8 +155,6 @@ test.describe.serial('KubernetesBackend', () => {
         expectedDefinition['application.adminAccess'] = false;
         expectedDefinition['virtualMachine.numberCPUs'] = false;
         expectedDefinition['virtualMachine.memoryInGB'] = false;
-      } else if (process.platform === 'win32') {
-        expectedDefinition['experimental.virtualMachine.networkingTunnel'] = false;
       }
 
       const expected: Record<string, {current: any, desired: any, severity: 'reset' | 'restart'}> = {};

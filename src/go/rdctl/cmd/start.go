@@ -23,10 +23,11 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 )
 
 // startCmd represents the start command
@@ -58,7 +59,7 @@ func init() {
  * If Rancher Desktop is currently running, treat this like a `set` command, and pass all the args to that.
  */
 func doStartOrSetCommand(cmd *cobra.Command) error {
-	_, err := getListSettings()
+	_, err := getListSettings(cmd.Context())
 	if err == nil {
 		// Unavoidable race condition here.
 		// There's no system-wide mutex that will let us guarantee that if rancher desktop is running when
@@ -80,7 +81,7 @@ func doStartCommand(cmd *cobra.Command) error {
 		return err
 	}
 	if !cmd.Flags().Changed("path") {
-		applicationPath, err = utils.GetRDPath()
+		applicationPath, err = paths.GetRDLaunchPath(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("failed to locate main Rancher Desktop executable: %w\nplease retry with the --path option", err)
 		}

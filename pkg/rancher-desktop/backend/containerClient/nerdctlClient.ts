@@ -211,7 +211,7 @@ export class NerdctlClient implements ContainerEngineClient {
       // Copy the archive to the host
       const hostWorkDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-nerdctl-copy-'));
 
-      cleanups.push(() => fs.promises.rm(hostWorkDir, { recursive: true }));
+      cleanups.push(() => fs.promises.rm(hostWorkDir, { recursive: true, maxRetries: 3 }));
       const hostArchive = path.join(hostWorkDir, 'copy-file.tgz');
 
       await this.vm.copyFileOut(archive, hostArchive);
@@ -321,11 +321,11 @@ export class NerdctlClient implements ContainerEngineClient {
       const archiveName = 'nerdctl-copy-in.tar';
       const hostDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-nerdctl-copy-in-'));
 
-      cleanups.push(() => fs.promises.rm(hostDir, { recursive: true }));
+      cleanups.push(() => fs.promises.rm(hostDir, { recursive: true, maxRetries: 3 }));
 
       const tarStream = fs.createWriteStream(path.join(hostDir, archiveName));
       const archive = tar.pack();
-      const archiveFinished = util.promisify(stream.finished)(archive);
+      const archiveFinished = util.promisify(stream.finished)(archive as any);
       const newEntry = util.promisify(archive.entry.bind(archive));
       const baseHeader: Partial<tar.Headers> = {
         mode:  0o755,
@@ -407,7 +407,7 @@ export class NerdctlClient implements ContainerEngineClient {
         const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-compose-'));
         const envFile = path.join(workDir, 'env.txt');
 
-        cleanups.push(() => fs.promises.rm(workDir, { recursive: true }));
+        cleanups.push(() => fs.promises.rm(workDir, { recursive: true, maxRetries: 3 }));
         await fs.promises.writeFile(envFile, envData);
 
         return {

@@ -11,11 +11,13 @@ import WSLBackend, { Action } from '../wsl';
 
 import INSTALL_K3S_SCRIPT from '@pkg/assets/scripts/install-k3s';
 import { BackendSettings, RestartReasons } from '@pkg/backend/backend';
-import BackendHelper from '@pkg/backend/backendHelper';
+import BackendHelper, { MANIFEST_CERT_MANAGER, MANIFEST_SPIN_OPERATOR } from '@pkg/backend/backendHelper';
 import * as K8s from '@pkg/backend/k8s';
+import { LockedFieldError } from '@pkg/config/commandLineOptions';
 import { ContainerEngine } from '@pkg/config/settings';
 import mainEvents from '@pkg/main/mainEvents';
 import { checkConnectivity } from '@pkg/main/networking';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
@@ -31,6 +33,8 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
     this.k3sHelper.on('versions-updated', () => this.emit('versions-updated'));
     this.k3sHelper.initialize().catch((err) => {
       console.log('k3sHelper.initialize failed: ', err);
+      // If we fail to initialize, we still need to continue (with no versions).
+      this.emit('versions-updated');
     });
     mainEvents.on('network-ready', () => this.k3sHelper.networkReady());
   }
@@ -63,7 +67,7 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
     return this.currentPort;
   }
 
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return this.k3sHelper.availableVersions;
   }
 
@@ -71,11 +75,31 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
     return await K3sHelper.cachedVersionsOnly();
   }
 
-  protected get desiredVersion(): Promise<semver.SemVer> {
+  protected get desiredVersion(): Promise<semver.SemVer | undefined> {
     return (async() => {
-      const availableVersions = (await this.k3sHelper.availableVersions).map(v => v.version);
+      let availableVersions: SemanticVersionEntry[];
+      let available = true;
 
-      return await BackendHelper.getDesiredVersion(this.cfg as BackendSettings, availableVersions, this.vm.noModalDialogs, this.vm.writeSetting.bind(this.vm));
+      try {
+        availableVersions = await this.k3sHelper.availableVersions;
+
+        return await BackendHelper.getDesiredVersion(
+          this.cfg as BackendSettings,
+          availableVersions,
+          this.vm.noModalDialogs,
+          this.vm.writeSetting.bind(this.vm));
+      } catch (ex) {
+        // Locked field errors are fatal and will quit the application
+        if (ex instanceof LockedFieldError) {
+          throw ex;
+        }
+        console.error(`Could not get desired version: ${ ex }`);
+        available = false;
+
+        return undefined;
+      } finally {
+        mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available });
+      }
     })();
   }
 
@@ -100,8 +124,8 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
 
   /**
    * Download K3s images.  This will also calculate the version to download.
-   * @returns The version of K3s images downloaded.  If startup should not
-   * continue, INVALID_VERSION is returned instead.
+   * @returns The version of K3s images downloaded, and whether this is a
+   * downgrade.
    */
   async download(cfg: BackendSettings): Promise<[semver.SemVer | undefined, boolean]> {
     this.cfg = cfg;
@@ -123,6 +147,10 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
 
     try {
       const desiredVersion = await this.desiredVersion;
+
+      if (desiredVersion === undefined) {
+        return [undefined, false];
+      }
 
       try {
         await this.progressTracker.action('Checking k3s images', 100, this.k3sHelper.ensureK3sImages(desiredVersion));
@@ -170,14 +198,31 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
   async install(config: BackendSettings, version: semver.SemVer, allowSudo: boolean) {
     await this.vm.runInstallScript(INSTALL_K3S_SCRIPT,
       'install-k3s', version.raw, await this.vm.wslify(path.join(paths.cache, 'k3s')));
-    await BackendHelper.configureRuntimeClasses(this.vm);
+
+    if (config.experimental?.containerEngine?.webAssembly?.enabled) {
+      const promises: Promise<void>[] = [];
+
+      promises.push(BackendHelper.configureRuntimeClasses(this.vm));
+      if (config.experimental?.kubernetes?.options?.spinkube) {
+        promises.push(BackendHelper.configureSpinOperator(this.vm));
+      }
+      await Promise.all(promises);
+    }
   }
 
-  async start(config: BackendSettings, activeVersion: semver.SemVer, kubeClient?: KubeClient): Promise<string> {
+  async start(config: BackendSettings, activeVersion: semver.SemVer, kubeClient?: () => KubeClient): Promise<void> {
     if (!config) {
       throw new Error('no config!');
     }
     this.cfg = config;
+
+    // Clean up kubernetes cgroups before we start, as Kubernetes 1.31.0+ fails
+    // to start if these are left over.  We need to remove all cgroups named
+    // "kubepods" as well as their descendants (which are expected to all be
+    // empty).
+    await this.progressTracker.action('Removing stale state', 50,
+      this.vm.execCommand('busybox', 'find', '/sys/fs/cgroup', '-name', 'kubepods', '-exec',
+        'busybox', 'find', '{}', '-type', 'd', '-delete', ';', '-prune'));
 
     const executable = config.containerEngine.name === ContainerEngine.MOBY ? 'docker' : 'nerdctl';
 
@@ -191,7 +236,7 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
 
     if (this.vm.currentAction !== Action.STARTING) {
       // User aborted
-      return '';
+      return;
     }
 
     await this.progressTracker.action(
@@ -213,13 +258,12 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
           }
           await util.promisify(timers.setTimeout)(1_000);
         }
-        const rdNetworking = `--rd-networking=${ config?.experimental.virtualMachine.networkingTunnel }`;
 
         await this.k3sHelper.updateKubeconfig(
-          async() => await this.vm.execCommand({ capture: true }, await this.vm.getWSLHelperPath(), 'k3s', 'kubeconfig', rdNetworking));
+          async() => await this.vm.execCommand({ capture: true }, await this.vm.getWSLHelperPath(), 'k3s', 'kubeconfig'));
       });
 
-    const client = this.client = kubeClient || new KubeClient();
+    const client = this.client = kubeClient?.() || new KubeClient();
 
     await this.progressTracker.action(
       'Waiting for services',
@@ -243,7 +287,16 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
       await this.progressTracker.action(
         'Removing Traefik',
         50,
-        this.k3sHelper.uninstallTraefik(client));
+        this.k3sHelper.uninstallHelmChart(client, 'traefik'));
+    }
+    if (!this.cfg?.experimental?.kubernetes?.options?.spinkube) {
+      await this.progressTracker.action(
+        'Removing spinkube operator',
+        50,
+        Promise.all([
+          this.k3sHelper.uninstallHelmChart(this.client, MANIFEST_CERT_MANAGER),
+          this.k3sHelper.uninstallHelmChart(this.client, MANIFEST_SPIN_OPERATOR),
+        ]));
     }
 
     await this.k3sHelper.getCompatibleKubectlVersion(this.activeVersion as semver.SemVer);
@@ -261,8 +314,6 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
         'Skipping node checks, flannel is disabled',
         100, Promise.resolve({}));
     }
-
-    return '';
   }
 
   async stop() {
@@ -295,12 +346,12 @@ export default class WSLKubernetesBackend extends events.EventEmitter implements
         'containerEngine.allowedImages.enabled':            undefined,
         'containerEngine.name':                             undefined,
         'experimental.containerEngine.webAssembly.enabled': undefined,
+        'experimental.kubernetes.options.spinkube':         undefined,
         'kubernetes.enabled':                               undefined,
         'kubernetes.ingress.localhostOnly':                 undefined,
         'kubernetes.options.flannel':                       undefined,
         'kubernetes.options.traefik':                       undefined,
         'kubernetes.port':                                  undefined,
-        'virtualMachine.hostResolver':                      undefined,
         'WSL.integrations':                                 undefined,
       },
       extras,

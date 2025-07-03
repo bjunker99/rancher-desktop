@@ -43,7 +43,7 @@ shim_version() {
 @test 'verify spin shim is not installed on PATH' {
     run shim_version spin v2
     assert_failure
-    assert_output --partial "containerd-shim-spin-v2: not found"
+    assert_output --regexp 'containerd-shim-spin-v2.*(not found|No such file)'
 }
 
 hello() {
@@ -112,9 +112,13 @@ download_shim() {
 
     local base_url="https://github.com/deislabs/containerd-wasm-shims/releases/download/v${MANUAL_VERSION}"
     local filename="containerd-wasm-shims-${version}-${shim}-linux-${ARCH}.tar.gz"
+    local host_archive
+
+    # Since we end up using curl.exe on Windows, pass the host path to curl.
+    host_archive=$(host_path "${PATH_CONTAINERD_SHIMS}/${filename}")
 
     mkdir -p "$PATH_CONTAINERD_SHIMS"
-    curl --silent --location --output "${PATH_CONTAINERD_SHIMS}/${filename}" "${base_url}/${filename}"
+    curl --location --output "$host_archive" "${base_url}/${filename}"
     tar xfz "${PATH_CONTAINERD_SHIMS}/${filename}" --directory "$PATH_CONTAINERD_SHIMS"
     rm "${PATH_CONTAINERD_SHIMS}/${filename}"
 }
@@ -124,7 +128,7 @@ download_shim() {
     download_shim wws v1
 
     rdctl shutdown
-    rdctl start
+    launch_the_application
     wait_for_container_engine
 }
 
@@ -140,7 +144,7 @@ verify_shim() {
     semver_eq "$output" "$MANUAL_VERSION"
 
     hello "$shim" "$version" "$lang" "$port" "$external_port"
-    try --max 5 --delay 2 curl --silent --fail "http://localhost:${port}/hello"
+    try --max 10 --delay 3 curl --silent --fail "http://localhost:${port}/hello"
 }
 
 @test 'verify spin shim' {

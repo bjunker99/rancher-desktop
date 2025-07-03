@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright © 2021 SUSE LLC
@@ -25,6 +24,7 @@ import (
 	"os"
 	"path"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -45,8 +45,22 @@ var kubeconfigCmd = &cobra.Command{
 	Long:  `This command configures the Kubernetes configuration inside a WSL2 distribution.`,
 	Args:  cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true
+
 		configPath := kubeconfigViper.GetString("kubeconfig")
 		enable := kubeconfigViper.GetBool("enable")
+		verify := kubeconfigViper.GetBool("verify")
+
+		configDir := path.Join(homedir.HomeDir(), ".kube")
+		linkPath := path.Join(configDir, "config")
+		unsupportedConfig, symlinkErr := requireManualSymlink(linkPath)
+		if verify {
+			if unsupportedConfig {
+				logrus.Fatalf("kubeConfig: %s contains non-rancher desktop configuration", linkPath)
+			}
+			logrus.Infof("Verified kubeConfig: %s, it only contains Rancher Desktop configuration", linkPath)
+			os.Exit(0)
+		}
 
 		if configPath == "" {
 			return errors.New("Windows kubeconfig not supplied")
@@ -56,11 +70,7 @@ var kubeconfigCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("could not open Windows kubeconfig: %w", err)
 		}
-		cmd.SilenceUsage = true
 
-		configDir := path.Join(homedir.HomeDir(), ".kube")
-		linkPath := path.Join(configDir, "config")
-		unsupportedConfig, symlinkErr := requireManualSymlink(linkPath)
 		if !unsupportedConfig && symlinkErr != nil {
 			return symlinkErr
 		}
@@ -124,8 +134,8 @@ func requireManualSymlink(linkPath string) (bool, error) {
 	return false, nil
 }
 
-func removeConfig(path string) error {
-	err := os.Remove(path)
+func removeConfig(configPath string) error {
+	err := os.Remove(configPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -148,9 +158,12 @@ func readKubeConfig(configPath string) (kubeConfig, error) {
 }
 
 func init() {
+	kubeconfigCmd.PersistentFlags().Bool("verify", false, "Checks whether the symlinked config contains non-Rancher Desktop configuration.")
 	kubeconfigCmd.PersistentFlags().Bool("enable", true, "Set up config file")
 	kubeconfigCmd.PersistentFlags().String("kubeconfig", "", "Path to Windows kubeconfig, in /mnt/... form.")
 	kubeconfigViper.AutomaticEnv()
-	kubeconfigViper.BindPFlags(kubeconfigCmd.PersistentFlags())
+	if err := kubeconfigViper.BindPFlags(kubeconfigCmd.PersistentFlags()); err != nil {
+		logrus.WithError(err).Fatal("Failed to set up flags")
+	}
 	rootCmd.AddCommand(kubeconfigCmd)
 }

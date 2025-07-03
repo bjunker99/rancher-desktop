@@ -57,7 +57,7 @@ sha\d+:[0-9]*[a-f]{3,}[0-9a-f]*
 
 # hit-count: 6 file-count: 4
 # tar arguments
-\b(?:\\n|)g?tar(?:\.exe|)(?:(?:\s+--[-a-zA-Z]+|\s+-[a-zA-Z]+|\s[ABGJMOPRSUWZacdfh-pr-xz]+\b)(?:=[^ ]*|))+
+\b(?:\\n|)g?tar(?:\.exe|)"?(?:(?:\s+--[-a-zA-Z]+|\s+-[a-zA-Z]+|\s[ABGJMOPRSUWZacdfh-pr-xz]+\b)(?:=[^ ]*|))+
 
 # hit-count: 4 file-count: 3
 # base64 encoded content
@@ -168,3 +168,15 @@ regexp?\.MustCompile\(`[^`]*`\)
 
 # GitHub owner names should not be checked (dependency scripts)
 \bgithubOwner\s*=\s*'.*?'
+
+# Win32 constants
+\bGWL_EXSTYLE\b
+\bHWND_NOTOPMOST\b
+\bSWP_NOMOVE\b
+\bSWP_NOSIZE\b
+
+# allow repetitive words in iptable rules
+DNAT\s+.*\s+anywhere anywhere
+
+# Image names
+\bghcr\.io/[A-Za-z0-9_/.-]+(?::[A-Za-z0-9_.-]+)?\b

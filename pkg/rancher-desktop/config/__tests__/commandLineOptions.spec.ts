@@ -26,7 +26,7 @@ describe('commandLineOptions', () => {
         name: settings.ContainerEngine.MOBY,
       },
       kubernetes: {
-        version: '1.23.5',
+        version: '1.29.5',
         port:    6443,
         enabled: true,
         options: {
@@ -72,17 +72,17 @@ describe('commandLineOptions', () => {
     });
 
     test('one option with embedded equal sign should change only one value', () => {
-      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version=1.23.6']);
+      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version=1.29.6']);
 
-      expect(newPrefs.kubernetes.version).toBe('1.23.6');
+      expect(newPrefs.kubernetes.version).toBe('1.29.6');
       newPrefs.kubernetes.version = origPrefs.kubernetes.version;
       expect(newPrefs).toEqual(origPrefs);
     });
 
     test('one option over two args should change only one value', () => {
-      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version', '1.23.7']);
+      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version', '1.29.7']);
 
-      expect(newPrefs.kubernetes.version).toBe('1.23.7');
+      expect(newPrefs.kubernetes.version).toBe('1.29.7');
       newPrefs.kubernetes.version = origPrefs.kubernetes.version;
       expect(newPrefs).toEqual(origPrefs);
     });
@@ -117,16 +117,13 @@ describe('commandLineOptions', () => {
     test('changes specified options', () => {
       const optionsByPlatform: Record<string, Array<string | [string, string]>> = {
         win32: [
-          '--virtualMachine.hostResolver',
+          '--experimental.virtualMachine.proxy.enabled',
         ],
         '!win32': [
           '--application.adminAccess',
           ['--application.pathManagementStrategy', 'rcfiles'],
           '--virtualMachine.memoryInGB',
           '--virtualMachine.numberCPUs',
-        ],
-        darwin: [
-          '--experimental.virtualMachine.socketVMNet',
         ],
         '*': [
           '--application.debug',
@@ -314,7 +311,7 @@ describe('commandLineOptions', () => {
 
       expect(() => {
         updateFromCommandLine(prefs, lockedSettings, [`${ arg }=${ value }`]);
-      }).toThrow(`Can't evaluate ${ arg }=${ value } as number: SyntaxError: Unexpected token a in JSON at position 0`);
+      }).toThrow(`Can't evaluate ${ arg }=${ value } as number: SyntaxError: Unexpected token 'a', \"angeles\" is not valid JSON`);
     });
 
     test('should complain about type mismatches', () => {

@@ -20,7 +20,12 @@ type wslDistro struct {
 	WorkingDirPath string
 }
 
-func (snapshotter SnapshotterImpl) WSLDistros(appPaths paths.Paths) []wslDistro {
+// SnapshotterImpl also works as a *Manager receiver
+type SnapshotterImpl struct {
+	wsl.WSL
+}
+
+func (snapshotter SnapshotterImpl) WSLDistros(appPaths *paths.Paths) []wslDistro {
 	return []wslDistro{
 		{
 			Name:           "rancher-desktop",
@@ -57,23 +62,17 @@ func copyFile(dst, src string) error {
 	return nil
 }
 
-// SnapshotterImpl also works as a *Manager receiver
-type SnapshotterImpl struct {
-	wsl.WSL
-}
-
 func NewSnapshotterImpl() SnapshotterImpl {
 	return SnapshotterImpl{
 		WSL: wsl.WSLImpl{},
 	}
 }
 
-func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths paths.Paths, snapshotDir string) error {
+func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths *paths.Paths, snapshotDir string) error {
 	taskRunner := runner.NewTaskRunner(ctx)
 
 	// export WSL distros to snapshot directory
 	for _, distro := range snapshotter.WSLDistros(appPaths) {
-		distro := distro
 		taskRunner.Add(func() error {
 			snapshotDistroPath := filepath.Join(snapshotDir, distro.Name+".tar")
 			if err := snapshotter.ExportDistro(distro.Name, snapshotDistroPath); err != nil {
@@ -106,7 +105,7 @@ func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths pat
 	return taskRunner.Wait()
 }
 
-func (snapshotter SnapshotterImpl) RestoreFiles(ctx context.Context, appPaths paths.Paths, snapshotDir string) error {
+func (snapshotter SnapshotterImpl) RestoreFiles(ctx context.Context, appPaths *paths.Paths, snapshotDir string) error {
 	tr := runner.NewTaskRunner(ctx)
 
 	// unregister WSL distros
@@ -119,7 +118,6 @@ func (snapshotter SnapshotterImpl) RestoreFiles(ctx context.Context, appPaths pa
 
 	// restore WSL distros
 	for _, distro := range snapshotter.WSLDistros(appPaths) {
-		distro := distro
 		tr.Add(func() error {
 			snapshotDistroPath := filepath.Join(snapshotDir, distro.Name+".tar")
 			if err := os.MkdirAll(distro.WorkingDirPath, 0o755); err != nil {

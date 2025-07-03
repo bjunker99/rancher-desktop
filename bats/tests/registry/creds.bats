@@ -39,8 +39,7 @@ local_setup() {
         # Essentially localhost, but needs to be a routable IP that also works
         # from inside a container. Will be turned into a DNS name using sslip.io.
         if is_windows; then
-            # In WSL all distros have the same IP address
-            ipaddr="$(ip a show eth0 | awk '/inet / {sub("/.*",""); print $2}')"
+            ipaddr="192.168.143.1"
         else
             # Lima uses a fixed hard-coded IP address
             ipaddr="192.168.5.15"
@@ -70,7 +69,7 @@ create_registry() {
 
 wait_for_registry() {
     # registry port is forwarded to host
-    try --max 10 --delay 5 curl -k --silent --show-error "https://localhost:$REGISTRY_PORT/v2/_catalog"
+    try --max 20 --delay 5 curl -k --silent --show-error "https://localhost:$REGISTRY_PORT/v2/_catalog"
 }
 
 using_insecure_registry() {
@@ -121,7 +120,7 @@ verify_default_credStore() {
     run ctrctl pull --quiet "$IMAGE_BUSYBOX"
     if using_image_allow_list; then
         assert_failure
-        assert_output --regexp "(unauthorized|Forbidden)"
+        assert_output --regexp "(UNAUTHORIZED|Forbidden)"
     else
         assert_success
     fi
@@ -165,13 +164,37 @@ verify_default_credStore() {
 @test 'restart container engine to refresh certs' {
     skip_for_insecure_registry
 
-    rdsudo rc-service "$CONTAINER_ENGINE_SERVICE" restart
-    rdsudo rc-service --ifstarted rd-openresty restart
-    wait_for_container_engine
-    # when Moby is stopped, the containers are stopped as well
-    if using_docker; then
-        wait_for_registry
+    # BUG BUG BUG
+    # When using containerd the guestagent currently doesn't enumerate
+    # running containers when it starts up to find existing open ports
+    # (it does this for moby only). Therefore it misses forwarding
+    # ports that have been opened while the guestagent was down.
+    #
+    # The guestagent would restart automatically when containerd
+    # restart. By explicitly stopping/restarting the guestagent we are
+    # more likely to have the new instance running by the time the
+    # containerd becomes ready.
+    #
+    # This workaround can be removed when the following bug has been fixed:
+    # https://github.com/rancher-sandbox/rancher-desktop/issues/7146
+    # BUG BUG BUG
+    if is_windows && using_containerd; then
+        service_control rancher-desktop-guestagent stop
     fi
+
+    service_control "$CONTAINER_ENGINE_SERVICE" restart
+
+    # BUG BUG BUG
+    # Second part of the workaround
+    # BUG BUG BUG
+    if is_windows && using_containerd; then
+        service_control rancher-desktop-guestagent start
+    fi
+
+    service_control --ifstarted rd-openresty restart
+
+    wait_for_container_engine
+    wait_for_registry
 }
 
 @test 'expect push image to registry to succeed now' {

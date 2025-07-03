@@ -1,0 +1,17 @@
+go 1.24.0
+
+toolchain go1.24.2
+
+use (
+	./scripts
+	./src/go/docker-credential-none
+	./src/go/extension-proxy
+	./src/go/guestagent
+	./src/go/mock-wsl
+	./src/go/nerdctl-stub
+	./src/go/nerdctl-stub/generate
+	./src/go/networking
+	./src/go/rdctl
+	./src/go/spin-stub
+	./src/go/wsl-helper
+)

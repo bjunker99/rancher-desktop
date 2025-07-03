@@ -18,11 +18,17 @@ const cfg = _.merge(
   {},
   settings.defaultSettings,
   {
-    kubernetes:  { version: '1.23.4' },
+    kubernetes:  { version: '1.29.4' },
     application: { pathManagementStrategy: PathManagementStrategy.Manual },
   });
 const subject = new SettingsValidator();
 let spyPlatform: jest.SpiedFunction<typeof os.platform>;
+
+beforeAll(async() => {
+  if (process.platform === 'darwin') {
+    await osVersion.fetchMacOsVersion();
+  }
+});
 
 beforeEach(() => {
   spyPlatform = jest.spyOn(os, 'platform');
@@ -33,7 +39,7 @@ afterEach(() => {
 });
 
 cfg.virtualMachine.memoryInGB ||= getDefaultMemory();
-subject.k8sVersions = ['1.23.4', '1.0.0'];
+subject.k8sVersions = ['1.29.4', '1.0.0'];
 describe(SettingsValidator, () => {
   it('should do nothing when given existing settings', () => {
     const [needToUpdate, errors] = subject.validateSettings(cfg, cfg);
@@ -72,33 +78,31 @@ describe(SettingsValidator, () => {
       ['application', 'pathManagementStrategy'],
       ['containerEngine', 'allowedImages', 'locked'],
       ['containerEngine', 'name'],
+      ['experimental', 'kubernetes', 'options', 'spinkube'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'cacheMode'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'msizeInKib'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'protocolVersion'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'securityModel'],
-      ['experimental', 'virtualMachine', 'mount', 'type'],
-      ['experimental', 'virtualMachine', 'type'],
-      ['experimental', 'virtualMachine', 'useRosetta'],
       ['experimental', 'virtualMachine', 'proxy', 'noproxy'],
       ['kubernetes', 'version'],
       ['version'],
+      ['virtualMachine', 'mount', 'type'],
+      ['virtualMachine', 'type'],
+      ['virtualMachine', 'useRosetta'],
       ['WSL', 'integrations'],
     ];
 
     // Fields that can only be set on specific platforms.
     const platformSpecificFields: Record<string, ReturnType<typeof os.platform>> = {
-      'application.adminAccess':                      'linux',
-      'experimental.virtualMachine.socketVMNet':      'darwin',
-      'experimental.virtualMachine.networkingTunnel': 'win32',
-      'experimental.virtualMachine.proxy.enabled':    'win32',
-      'experimental.virtualMachine.proxy.address':    'win32',
-      'experimental.virtualMachine.proxy.password':   'win32',
-      'experimental.virtualMachine.proxy.port':       'win32',
-      'experimental.virtualMachine.proxy.username':   'win32',
-      'kubernetes.ingress.localhostOnly':             'win32',
-      'virtualMachine.hostResolver':                  'win32',
-      'virtualMachine.memoryInGB':                    'darwin',
-      'virtualMachine.numberCPUs':                    'linux',
+      'application.adminAccess':                    'linux',
+      'experimental.virtualMachine.proxy.enabled':  'win32',
+      'experimental.virtualMachine.proxy.address':  'win32',
+      'experimental.virtualMachine.proxy.password': 'win32',
+      'experimental.virtualMachine.proxy.port':     'win32',
+      'experimental.virtualMachine.proxy.username': 'win32',
+      'kubernetes.ingress.localhostOnly':           'win32',
+      'virtualMachine.memoryInGB':                  'darwin',
+      'virtualMachine.numberCPUs':                  'linux',
     };
 
     const spyValidateSettings = jest.spyOn(subject, 'validateSettings');
@@ -803,7 +807,7 @@ describe(SettingsValidator, () => {
     ]);
   });
 
-  describe('experimental.virtualMachine.type', () => {
+  describe('virtualMachine.type', () => {
     let spyArch: jest.SpiedFunction<typeof os.arch>;
     let spyMacOsVersion: jest.SpiedFunction<typeof osVersion.getMacOsVersion>;
 
@@ -826,23 +830,19 @@ describe(SettingsValidator, () => {
       ]);
     }
 
-    function getVMTypeSetting(vmType: VMType) {
+    function getVMTypeSetting(vmType: VMType): RecursivePartial<settings.Settings> {
       return {
-        experimental: {
-          virtualMachine: {
-            type: vmType,
-          },
+        virtualMachine: {
+          type: vmType,
         },
       };
     }
 
-    function getMountTypeSetting(mountType: MountType) {
+    function getMountTypeSetting(mountType: MountType): RecursivePartial<settings.Settings> {
       return {
-        experimental: {
-          virtualMachine: {
-            mount: {
-              type: mountType,
-            },
+        virtualMachine: {
+          mount: {
+            type: mountType,
           },
         },
       };
@@ -856,18 +856,19 @@ describe(SettingsValidator, () => {
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" on ARM requires macOS 13.3 (Ventura) or later.',
+        'Setting virtualMachine.type to \"vz\" on ARM requires macOS 13.3 (Ventura) or later.',
       );
     });
 
     it('should reject VZ if architecture is Intel macOS version < 13.0.0', () => {
+      spyArch.mockReturnValue('x64');
       spyMacOsVersion.mockReturnValue(new SemVer('12.0.0'));
       const [needToUpdate, errors] = subject.validateSettings(
         cfg, getVMTypeSetting(VMType.VZ));
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" on Intel requires macOS 13.0 (Ventura) or later.',
+        'Setting virtualMachine.type to \"vz\" on Intel requires macOS 13.0 (Ventura) or later.',
       );
     });
 
@@ -878,8 +879,8 @@ describe(SettingsValidator, () => {
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" requires that ' +
-        'experimental.virtual-machine.mount.type is \"reverse-sshfs\" or \"virtiofs\".',
+        'Setting virtualMachine.type to \"vz\" requires that ' +
+        'virtual-machine.mount.type is \"reverse-sshfs\" or \"virtiofs\".',
       );
     });
 
@@ -889,8 +890,8 @@ describe(SettingsValidator, () => {
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"qemu\" requires that ' +
-        'experimental.virtual-machine.mount.type is \"reverse-sshfs\" or \"9p\".',
+        'Setting virtualMachine.type to \"qemu\" requires that ' +
+        'virtual-machine.mount.type is \"reverse-sshfs\" or \"9p\".',
       );
     });
   });

@@ -11,6 +11,12 @@ import type { TransientSettings } from '@pkg/config/transientSettings';
 import { DiagnosticsCheckerResult } from '@pkg/main/diagnostics/types';
 import { RecursivePartial, RecursiveReadonly } from '@pkg/utils/typeUtils';
 
+export class NoMainEventsHandlerError extends Error {
+  constructor(eventName: string) {
+    super(`No handlers registered for mainEvents::${ eventName }`);
+  }
+}
+
 /**
  * MainEventNames describes the events available over the MainEvents event
  * emitter.  All normal events are described as methods returning void, with
@@ -75,6 +81,12 @@ interface MainEventNames {
   'network-ready'(): void;
 
   /**
+   * Emitted when the network comes online or goes offline.
+   * @param connected The new network state.
+   */
+  'update-network-status'(connected: boolean): void;
+
+  /**
    * Emitted when the integration state has changed.
    *
    * @param state A mapping of WSL distributions to the current state, or a
@@ -98,13 +110,31 @@ interface MainEventNames {
    * @note This does not update the last run time (since it only runs a single
    * checker).
    */
-  'diagnostics-trigger'(id: string): DiagnosticsCheckerResult | undefined;
+  'diagnostics-trigger'(id: string): DiagnosticsCheckerResult|DiagnosticsCheckerResult[] | undefined;
+
+  /**
+   * Generically signify that a diagnostic should be updated.
+   * @param id The diagnostic identifier.
+   * @param state The new state for the diagnostic.
+   */
+  'diagnostics-event'(payload: DiagnosticsEventPayload): void;
 
   /**
    * Emitted when an extension is uninstalled via the extension manager.
    * @param id The ID of the extension that was uninstalled.
    */
   'extensions/ui/uninstall'(id: string): void;
+
+  /**
+   * Emitted on application quit; this is used to shut down extensions.
+   */
+  'extensions/shutdown'(): Promise<void>;
+
+  /**
+   * Register the extension protocol handler in the given webContents partition.
+   * @param partition The partition name; likely "persist:rdx-..."
+   */
+  'extensions/register-protocol'(partition: string): Promise<void>;
 
   /**
    * Emitted on application quit, used to shut down any integrations.  This
@@ -136,6 +166,15 @@ interface MainEventNames {
 
   'dialog-info'(args: Record<string, string>): void;
 }
+
+/**
+ * DiagnosticsEventPayload defines the data that will be passed on a
+ * 'diagnostics-event' event.
+ */
+type DiagnosticsEventPayload =
+  { id: 'integrations-windows', distro?: string, key: string, error?: Error } |
+  { id: 'kube-versions-available', available: boolean } |
+  { id: 'path-management', fileName: string; error: Error | undefined };
 
 /**
  * Helper type definition to check if the given event name is a handler (i.e.
@@ -202,17 +241,26 @@ interface MainEvents extends EventEmitter {
     ...args: HandlerParams<eventName>): Promise<HandlerReturn<eventName>>;
 
   /**
-   * Register a handler that will handle invoke() callers.
+   * Invoke a handler that returns a promise of a result.  Unlike `invoke`, this
+   * does not raise an exception if the event handler is not registered.
+   */
+  tryInvoke<eventName extends keyof MainEventNames>(
+    event: IsHandler<eventName> extends true ? eventName : never,
+    ...args: HandlerParams<eventName>): Promise<HandlerReturn<eventName> | undefined>;
+
+  /**
+   * Register a handler that will handle invoke() callers.  If the given handler
+   * is `undefined`, unregister it instead.
    */
   handle<eventName extends keyof MainEventNames>(
     event: IsHandler<eventName> extends true ? eventName : never,
-    handler: HandlerType<eventName>
+    handler: HandlerType<eventName> | undefined,
   ): void;
 }
 
 class MainEventsImpl extends EventEmitter implements MainEvents {
   handlers: {
-    [eventName in keyof MainEventNames]?: HandlerType<eventName> | undefined;
+    [eventName in keyof MainEventNames]?: IsHandler<eventName> extends true ? HandlerType<eventName> : never;
   } = {};
 
   emit<eventName extends keyof MainEventNames>(
@@ -260,14 +308,27 @@ class MainEventsImpl extends EventEmitter implements MainEvents {
     if (handler) {
       return await handler(...args);
     }
-    throw new Error(`No handlers registered for mainEvents::${ event }`);
+    throw new NoMainEventsHandlerError(event);
+  }
+
+  async tryInvoke<eventName extends keyof MainEventNames>(
+    event: IsHandler<eventName> extends true ? eventName : never,
+    ...args: HandlerParams<eventName>
+  ): Promise<HandlerReturn<eventName> | undefined> {
+    const handler: HandlerType<eventName> | undefined = this.handlers[event];
+
+    return await handler?.(...args);
   }
 
   handle<eventName extends keyof MainEventNames>(
     event: IsHandler<eventName> extends true ? eventName : never,
-    handler: HandlerType<eventName>,
+    handler: HandlerType<eventName> | undefined,
   ): void {
-    this.handlers[event] = handler as any;
+    if (handler) {
+      this.handlers[event] = handler as any;
+    } else {
+      delete this.handlers[event];
+    }
   }
 }
 const mainEvents: MainEvents = new MainEventsImpl();

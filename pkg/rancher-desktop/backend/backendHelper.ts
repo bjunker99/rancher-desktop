@@ -5,13 +5,16 @@ import merge from 'lodash/merge';
 import semver from 'semver';
 import yaml from 'yaml';
 
+import CERT_MANAGER from '@pkg/assets/scripts/cert-manager.yaml';
 import INSTALL_CONTAINERD_SHIMS_SCRIPT from '@pkg/assets/scripts/install-containerd-shims';
 import CONTAINERD_CONFIG from '@pkg/assets/scripts/k3s-containerd-config.toml';
+import SPIN_OPERATOR from '@pkg/assets/scripts/spin-operator.yaml';
 import { BackendSettings, VMExecutor } from '@pkg/backend/backend';
 import { LockedFieldError } from '@pkg/config/commandLineOptions';
 import { ContainerEngine, Settings } from '@pkg/config/settings';
 import * as settingsImpl from '@pkg/config/settingsImpl';
 import SettingsValidator from '@pkg/main/commandServer/settingsValidator';
+import { minimumUpgradeVersion, SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
@@ -19,8 +22,20 @@ import { showMessageBox } from '@pkg/window';
 
 const CONTAINERD_CONFIG_TOML = '/etc/containerd/config.toml';
 const DOCKER_DAEMON_JSON = '/etc/docker/daemon.json';
-// Don't use `runtimes.yaml` because k3s may overwrite it.
-const MANIFESTS_RUNTIMES_YAML = '/var/lib/rancher/k3s/server/manifests/rd-runtimes.yaml';
+
+const MANIFEST_DIR = '/var/lib/rancher/k3s/server/manifests';
+
+// Manifests are applied in sort order, so use a prefix to load them last, in the required sequence.
+// Names should start with `z` followed by a digit, so that `install-k3s` cleans them up on restart.
+export const MANIFEST_RUNTIMES = 'z100-runtimes';
+export const MANIFEST_CERT_MANAGER_CRDS = 'z110-cert-manager.crds';
+export const MANIFEST_CERT_MANAGER = 'z115-cert-manager';
+export const MANIFEST_SPIN_OPERATOR_CRDS = 'z120-spin-operator.crds';
+export const MANIFEST_SPIN_OPERATOR = 'z125-spin-operator';
+
+const STATIC_DIR = '/var/lib/rancher/k3s/server/static/rancher-desktop';
+const STATIC_CERT_MANAGER_CHART = `${ STATIC_DIR }/cert-manager.tgz`;
+const STATIC_SPIN_OPERATOR_CHART = `${ STATIC_DIR }/spin-operator.tgz`;
 
 const console = Logging.kube;
 
@@ -129,12 +144,22 @@ export default class BackendHelper {
     return patterns;
   }
 
-  /**
-   * k3s versions 1.24.1 to 1.24.3 don't support the --docker option and need to talk to
-   * a cri_dockerd endpoint when using the moby engine.
-   */
   static requiresCRIDockerd(engineName: string, kubeVersion: string | semver.SemVer): boolean {
-    return engineName === ContainerEngine.MOBY && semver.gte(kubeVersion, '1.24.1') && semver.lte(kubeVersion, '1.24.3');
+    if (engineName !== ContainerEngine.MOBY) {
+      return false;
+    }
+    const ranges = [
+      // versions 1.24.1 to 1.24.3 don't support the --docker option
+      '1.24.1 - 1.24.3',
+      // cri-dockerd bundled with k3s is not compatible with docker 25.x (using API 1.44)
+      // see https://github.com/k3s-io/k3s/issues/9279
+      '1.26.8 - 1.26.13',
+      '1.27.5 - 1.27.10',
+      '1.28.0 - 1.28.6',
+      '1.29.0 - 1.29.1',
+    ];
+
+    return semver.satisfies(kubeVersion, ranges.join('||'));
   }
 
   static checkForLockedVersion(newVersion: semver.SemVer, cfg: BackendSettings, sv: SettingsValidator): void {
@@ -152,13 +177,13 @@ export default class BackendHelper {
   /**
    * Validate the cfg.kubernetes.version string
    * If it's valid and available, use it.
-   * Otherwise fall back to the first (recommended) available version.
+   * Otherwise fall back to the minimum upgrade version (highest patch release of lowest available version).
    */
-  static async getDesiredVersion(cfg: BackendSettings, availableVersions: semver.SemVer[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
+  static async getDesiredVersion(cfg: BackendSettings, availableVersions: SemanticVersionEntry[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
     const currentConfigVersionString = cfg?.kubernetes?.version;
     let storedVersion: semver.SemVer | null;
-    let matchedVersion: semver.SemVer | undefined;
-    const invalidK8sVersionMainMessage = `Requested kubernetes version '${ currentConfigVersionString }' is not a valid version.`;
+    let matchedVersion: SemanticVersionEntry | undefined;
+    const invalidK8sVersionMainMessage = `Requested kubernetes version '${ currentConfigVersionString }' is not a supported version.`;
     const sv = new SettingsValidator();
     const lockedSettings = settingsImpl.getLockedSettings();
     const versionIsLocked = lockedSettings.kubernetes?.version ?? false;
@@ -173,13 +198,20 @@ export default class BackendHelper {
       throw new Error('No kubernetes version available.');
     }
 
-    sv.k8sVersions = availableVersions.map(v => v.version);
+    const upgradeVersion = minimumUpgradeVersion(availableVersions);
+
+    if (!upgradeVersion) {
+      // This should never be reached, as `availableVersions` isn't empty.
+      throw new Error('Failed to find upgrade version.');
+    }
+
+    sv.k8sVersions = availableVersions.map(v => v.version.version);
     if (currentConfigVersionString) {
       storedVersion = semver.parse(currentConfigVersionString);
       if (storedVersion) {
         matchedVersion = availableVersions.find((v) => {
           try {
-            return v.compare(storedVersion as semver.SemVer) === 0;
+            return semver.eq(v.version, storedVersion!);
           } catch (err: any) {
             console.error(`Can't compare versions ${ storedVersion } and ${ v }: `, err);
             if (!(err instanceof TypeError)) {
@@ -192,9 +224,9 @@ export default class BackendHelper {
         });
         if (matchedVersion) {
           // This throws a LockedFieldError if it fails.
-          this.checkForLockedVersion(matchedVersion, cfg, sv);
+          this.checkForLockedVersion(matchedVersion.version, cfg, sv);
 
-          return matchedVersion;
+          return matchedVersion.version;
         } else if (versionIsLocked) {
           // This is a bit subtle. If we're here, the user specified a nonexistent version in the locked manifest.
           // We can't switch to the default version, so throw a fatal error.
@@ -206,7 +238,7 @@ export default class BackendHelper {
         throw new LockedFieldError(`Locked kubernetes version '${ currentConfigVersionString }' isn't a valid version.`);
       }
       const message = invalidK8sVersionMainMessage;
-      const detail = `Falling back to the most recent stable version of ${ availableVersions[0] }`;
+      const detail = `Falling back to recommended minimum upgrade version of ${ upgradeVersion.version.version }`;
 
       if (noModalDialogs) {
         console.log(`${ message } ${ detail }`);
@@ -223,10 +255,10 @@ export default class BackendHelper {
       }
     }
     // No (valid) stored version; save the default one.
-    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion
-    settingsWriter({ kubernetes: { version: availableVersions[0].version } });
+    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion.
+    settingsWriter({ kubernetes: { version: upgradeVersion.version.version } });
 
-    return availableVersions[0];
+    return upgradeVersion.version;
   }
 
   /**
@@ -254,6 +286,10 @@ export default class BackendHelper {
     return shims;
   }
 
+  private static manifestFilename(manifest: string): string {
+    return `${ MANIFEST_DIR }/${ manifest }.yaml`;
+  }
+
   /**
    * Write a k3s manifest to define a runtime class for each installed containerd shim.
    */
@@ -269,19 +305,29 @@ export default class BackendHelper {
       });
     }
 
-    await vmx.execCommand({ root: true }, 'mkdir', '-p', path.dirname(MANIFESTS_RUNTIMES_YAML));
     // Don't let k3s define runtime classes, only use the ones defined by Rancher Desktop.
-    await vmx.execCommand({ root: true }, 'touch', `${ path.dirname(MANIFESTS_RUNTIMES_YAML) }/runtimes.yaml.skip`);
+    await vmx.execCommand({ root: true }, 'touch', `${ MANIFEST_DIR }/runtimes.yaml.skip`);
 
-    if (runtimes.length === 0) {
-      // We delete the manifest file, but we don't actually delete old runtime classes in k3s that no longer exist.
-      // They won't work though, as the symlinks in /usr/local/bin have been removed.
-      await vmx.execCommand({ root: true }, 'rm', '-f', MANIFESTS_RUNTIMES_YAML);
-    } else {
+    if (runtimes.length > 0) {
       const manifest = runtimes.map(r => yaml.stringify(r)).join('---\n');
 
-      await vmx.writeFile(MANIFESTS_RUNTIMES_YAML, manifest, 0o644);
+      await vmx.writeFile(this.manifestFilename(MANIFEST_RUNTIMES), manifest, 0o644);
     }
+  }
+
+  /**
+   * Write k3s manifests to install cert-manager and spinkube operator
+   */
+  static async configureSpinOperator(vmx: VMExecutor) {
+    await Promise.all([
+      vmx.copyFileIn(path.join(paths.resources, 'cert-manager.crds.yaml'), this.manifestFilename(MANIFEST_CERT_MANAGER_CRDS)),
+      vmx.copyFileIn(path.join(paths.resources, 'cert-manager.tgz'), STATIC_CERT_MANAGER_CHART),
+      vmx.writeFile(this.manifestFilename(MANIFEST_CERT_MANAGER), CERT_MANAGER, 0o644),
+
+      vmx.copyFileIn(path.join(paths.resources, 'spin-operator.crds.yaml'), this.manifestFilename(MANIFEST_SPIN_OPERATOR_CRDS)),
+      vmx.copyFileIn(path.join(paths.resources, 'spin-operator.tgz'), STATIC_SPIN_OPERATOR_CHART),
+      vmx.writeFile(this.manifestFilename(MANIFEST_SPIN_OPERATOR), SPIN_OPERATOR, 0o644),
+    ]);
   }
 
   /**

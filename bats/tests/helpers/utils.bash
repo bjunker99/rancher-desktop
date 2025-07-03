@@ -76,6 +76,14 @@ refute_not_exists() {
     assert_exists "$@"
 }
 
+refute_file_exists() {
+    assert_file_not_exists "$@"
+}
+
+refute_file_contains() {
+    assert_file_not_contains "$@"
+}
+
 ########################################################################
 
 # Convert raw string into properly quoted JSON string
@@ -105,6 +113,9 @@ join_map() {
     echo "$result"
 }
 
+# Run jq on the current $output
+# Note that when capturing $output, you may need to use `run --separate-stderr`
+# to avoid also capturing stderr and ending up with invalid JSON.
 jq_output() {
     local json=$output
     run jq --raw-output "$@" <<<"${json}"
@@ -206,27 +217,42 @@ calling_function() {
     echo "${FUNCNAME[2]}"
 }
 
-# Write a comment to the TAP stream
+# Write a comment to the TAP stream.
 # Set CALLER to print a calling function higher up in the call stack.
-trace() {
-    if is_false "$RD_TRACE"; then
-        return
+comment() {
+    local prefix=""
+    if is_true "$RD_TRACE"; then
+        local caller="${CALLER:-$(calling_function)}"
+        prefix="($(date -u +"%FT%TZ"): ${caller}): "
     fi
-    local caller="${CALLER:-$(calling_function)}"
-    caller="$(date -u +"%FT%TZ"): $caller"
     local line
     while IFS= read -r line; do
         if [[ -e /dev/fd/3 ]]; then
-            printf "# (%s): %s\n" "$caller" "$line" >&3
+            printf "# %s%s\n" "$prefix" "$line" >&3
         else
-            printf "# (%s): %s\n" "$caller" "$line" >&2
+            printf "# %s%s\n" "$prefix" "$line" >&2
         fi
     done <<<"$*"
 }
 
+# Write a comment to the TAP stream if RD_TRACE is set.
+# Set CALLER to print a calling function higher up in the call stack.
+trace() {
+    if is_true "$RD_TRACE"; then
+        CALLER=${CALLER:-$(calling_function)} comment "$@"
+    fi
+}
+
+# try runs the specified command until it either succeeds, or --max attempts
+# have been made (with a --delay seconds sleep in between).
+#
+# Right now the command is **always** run with --separate-stderr, and stderr
+# is output after all of stdout. This is subject to change, if we can figure
+# out a way to detect if the caller used `run --separate-stderr try …` or not.
 try() {
     local max=24
     local delay=5
+
     while [[ $# -gt 0 ]] && [[ $1 == -* ]]; do
         case "$1" in
         --max)
@@ -251,13 +277,17 @@ try() {
 
     local count=0
     while true; do
-        run "$@"
+        run --separate-stderr "$@"
         if ((status == 0 || ++count >= max)); then
+            trace "$count/$max tries: $*"
             break
         fi
         sleep "$delay"
     done
     echo "$output"
+    if [ -n "${stderr:-}" ]; then
+        echo "$stderr" >&2
+    fi
     return "$status"
 }
 
@@ -357,6 +387,12 @@ capture_logs() {
         local logdir
         logdir=$(unique_filename "${PATH_BATS_LOGS}/${RD_TEST_FILENAME}")
         mkdir -p "$logdir"
+        # On Linux/macOS, the symlinks to the lima logs might be dangling.
+        # Remove any dangling ones before doing the copy.
+        find -L "${PATH_LOGS}/" -type l \
+            -exec rm -f -- '{}' ';' \
+            -exec touch -- '{}' ';' \
+            -exec echo 'Replaced dangling symlink with empty file:' '{}' ';'
         cp -LR "${PATH_LOGS}/" "$logdir"
         echo "${BATS_TEST_DESCRIPTION:-teardown}" >"${logdir}/test_description"
         # Capture settings.json
@@ -389,7 +425,12 @@ take_screenshot() {
 
 skip_unless_host_ip() {
     if using_windows_exe; then
-        HOST_IP=$(netsh.exe interface ip show addresses 'vEthernet (WSL)' | grep -Po 'IP Address:\s+\K[\d.]+')
+        # Make sure the exit code is 0 even when netsh.exe or grep fails, in case errexit is in effect
+        HOST_IP=$(netsh.exe interface ip show addresses 'vEthernet (WSL)' | grep -Po 'IP Address:\s+\K[\d.]+' || :)
+        # The veth interface name changed at some time on Windows 11, so try the new name if the old one doesn't exist
+        if [[ -z $HOST_IP ]]; then
+            HOST_IP=$(netsh.exe interface ip show addresses 'vEthernet (WSL (Hyper-V firewall))' | grep -Po 'IP Address:\s+\K[\d.]+' || :)
+        fi
     else
         # TODO determine if the Lima VM has its own IP address
         HOST_IP=""
@@ -416,8 +457,19 @@ foreach_k3s_version() {
 }
 
 _foreach_k3s_version() {
-    local RD_KUBERNETES_PREV_VERSION=$1
+    local RD_KUBERNETES_VERSION=$1
+    local skip_kubernetes_version
+    skip_kubernetes_version=$(cat "${BATS_FILE_TMPDIR}/skip-kubernetes-version" 2>/dev/null || echo none)
+    if [[ $skip_kubernetes_version == "$RD_KUBERNETES_VERSION" ]]; then
+        skip "All remaining tests for Kubernetes $RD_KUBERNETES_VERSION are skipped"
+    fi
     "$2"
+}
+
+# Tests can call mark_k3s_version_skipped to skip the rest of the tests within
+# this iteration of foreach_k3s_version.
+mark_k3s_version_skipped() {
+    echo "$RD_KUBERNETES_VERSION" >"${BATS_FILE_TMPDIR}/skip-kubernetes-version"
 }
 
 ########################################################################

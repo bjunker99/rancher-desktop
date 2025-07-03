@@ -4,8 +4,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/hashicorp/go-multierror"
 	"strings"
+
+	"github.com/hashicorp/go-multierror"
 )
 
 func runCleanups(cleanups []cleanupFunc) error {

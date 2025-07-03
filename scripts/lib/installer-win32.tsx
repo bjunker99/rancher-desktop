@@ -10,7 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import asar from '@electron/asar';
+import { extractFile } from '@electron/asar';
 import Mustache from 'mustache';
 import yaml from 'yaml';
 
@@ -23,7 +23,7 @@ import { simpleSpawn } from 'scripts/simple_process';
  * Return the contents of package.json embedded in the application.
  */
 function getPackageJson(appDir: string): Record<string, any> {
-  const packageBytes = asar.extractFile(path.join(appDir, 'resources', 'app.asar'), 'package.json');
+  const packageBytes = extractFile(path.join(appDir, 'resources', 'app.asar'), 'package.json');
 
   return JSON.parse(packageBytes.toString('utf-8'));
 }
@@ -58,20 +58,18 @@ export async function buildCustomAction(): Promise<string> {
  * Given an unpacked build, produce a MSI installer.
  * @param workDir Directory in which we can write temporary work files.
  * @param appDir Directory containing extracted application zip file.
- * @param development True if we're in dev mode
+ * @param outFile Override for the file name to emit.
  * @returns The path of the built installer.
  */
-export default async function buildInstaller(workDir: string, appDir: string, development = false): Promise<string> {
+export default async function buildInstaller(workDir: string, appDir: string, outFile = ''): Promise<string> {
   const appVersion = getAppVersion(appDir);
-  const compressionLevel = development ? 'mszip' : 'high';
-  const outFile = path.join(process.cwd(), 'dist', `Rancher Desktop Setup ${ appVersion }.msi`);
+
+  outFile ||= path.join(process.cwd(), 'dist', `Rancher.Desktop.Setup.${ appVersion }.msi`);
 
   await writeUpdateConfig(appDir);
   const fileList = await generateFileList(appDir);
   const template = await fs.promises.readFile(path.join(process.cwd(), 'build', 'wix', 'main.wxs'), 'utf-8');
-  const output = Mustache.render(template, {
-    appVersion, compressionLevel, fileList,
-  });
+  const output = Mustache.render(template, { appVersion, fileList });
   const wixDir = path.join(process.cwd(), 'resources', 'host', 'wix');
 
   console.log('Writing out WiX definition...');

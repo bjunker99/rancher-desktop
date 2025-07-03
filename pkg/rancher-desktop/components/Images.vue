@@ -71,6 +71,7 @@
             :current-command="currentCommand"
             :image-output-culler="imageOutputCuller"
             :show-status="false"
+            :image-to-pull="imageToPull"
             @ok:process-end="resetCurrentCommand"
             @ok:show="toggleOutput"
           />
@@ -89,12 +90,12 @@
 </template>
 
 <script>
-import SortableTable from '@pkg/components/SortableTable';
 import { Card, Checkbox } from '@rancher/components';
 import _ from 'lodash';
 import { mapState, mapMutations } from 'vuex';
 
 import ImagesOutputWindow from '@pkg/components/ImagesOutputWindow.vue';
+import SortableTable from '@pkg/components/SortableTable';
 import getImageOutputCuller from '@pkg/utils/imageOutputCuller';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import { parseSi } from '@pkg/utils/units';
@@ -168,6 +169,7 @@ export default {
       imageOutputCuller:                null,
       mainWindowScroll:                 -1,
       selected:                         [],
+      imageToPull:                      null,
     };
   },
   computed: {
@@ -359,7 +361,7 @@ export default {
     scanImage(obj) {
       const taggedImageName = `${ obj.imageName.trim() }:${ this.imageTag(obj.tag) }`;
 
-      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName } });
+      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName, namespace: this.selectedNamespace } });
     },
     imageTag(tag) {
       return tag === '<none>' ? 'latest' : `${ tag.trim() }`;

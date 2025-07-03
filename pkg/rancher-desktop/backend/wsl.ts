@@ -13,11 +13,19 @@ import semver from 'semver';
 import tar from 'tar-stream';
 
 import {
-  BackendError, BackendEvents, BackendProgress, BackendSettings, execOptions, FailureDetails, RestartReasons, State, VMBackend, VMExecutor,
+  BackendError,
+  BackendEvents,
+  BackendProgress,
+  BackendSettings,
+  execOptions,
+  FailureDetails,
+  RestartReasons,
+  State,
+  VMBackend,
+  VMExecutor,
 } from './backend';
 import BackendHelper from './backendHelper';
 import { ContainerEngineClient, MobyClient, NerdctlClient } from './containerClient';
-import K3sHelper from './k3sHelper';
 import ProgressTracker, { getProgressErrorDescription } from './progressTracker';
 
 import DEPENDENCY_VERSIONS from '@pkg/assets/dependencies.yaml';
@@ -25,7 +33,6 @@ import FLANNEL_CONFLIST from '@pkg/assets/scripts/10-flannel.conflist';
 import SERVICE_BUILDKITD_CONF from '@pkg/assets/scripts/buildkit.confd';
 import SERVICE_BUILDKITD_INIT from '@pkg/assets/scripts/buildkit.initd';
 import CONFIGURE_IMAGE_ALLOW_LIST from '@pkg/assets/scripts/configure-allowed-images';
-import SERVICE_SCRIPT_DNSMASQ_GENERATE from '@pkg/assets/scripts/dnsmasq-generate.initd';
 import DOCKER_CREDENTIAL_SCRIPT from '@pkg/assets/scripts/docker-credential-rancher-desktop';
 import INSTALL_WSL_HELPERS_SCRIPT from '@pkg/assets/scripts/install-wsl-helpers';
 import LOGROTATE_K3S_SCRIPT from '@pkg/assets/scripts/logrotate-k3s';
@@ -35,23 +42,18 @@ import NERDCTL from '@pkg/assets/scripts/nerdctl';
 import NGINX_CONF from '@pkg/assets/scripts/nginx.conf';
 import SERVICE_GUEST_AGENT_INIT from '@pkg/assets/scripts/rancher-desktop-guestagent.initd';
 import SERVICE_SCRIPT_CRI_DOCKERD from '@pkg/assets/scripts/service-cri-dockerd.initd';
-import SERVICE_SCRIPT_HOST_RESOLVER from '@pkg/assets/scripts/service-host-resolver.initd';
 import SERVICE_SCRIPT_K3S from '@pkg/assets/scripts/service-k3s.initd';
-import SERVICE_VTUNNEL_PEER from '@pkg/assets/scripts/service-vtunnel-peer.initd';
 import SERVICE_SCRIPT_DOCKERD from '@pkg/assets/scripts/service-wsl-dockerd.initd';
 import SCRIPT_DATA_WSL_CONF from '@pkg/assets/scripts/wsl-data.conf';
 import WSL_EXEC from '@pkg/assets/scripts/wsl-exec';
 import WSL_INIT_SCRIPT from '@pkg/assets/scripts/wsl-init';
-import WSL_INIT_RD_NETWORKING_SCRIPT from '@pkg/assets/scripts/wsl-init-rd-networking';
 import { ContainerEngine } from '@pkg/config/settings';
 import { getServerCredentialsPath, ServerState } from '@pkg/main/credentialServer/httpCredentialHelperServer';
 import mainEvents from '@pkg/main/mainEvents';
-import { getVtunnelInstance, getVtunnelConfigPath } from '@pkg/main/networking/vtunnel';
 import BackgroundProcess from '@pkg/utils/backgroundProcess';
 import * as childProcess from '@pkg/utils/childProcess';
 import clone from '@pkg/utils/clone';
 import Logging from '@pkg/utils/logging';
-import { wslHostIPv4Address } from '@pkg/utils/networks';
 import paths from '@pkg/utils/paths';
 import { executable } from '@pkg/utils/resources';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
@@ -70,6 +72,8 @@ const CREDENTIAL_FORWARDER_SETTINGS_PATH = `${ ETC_RANCHER_DESKTOP_DIR }/credfwd
 const DOCKER_CREDENTIAL_PATH = '/usr/local/bin/docker-credential-rancher-desktop';
 const ROOT_DOCKER_CONFIG_DIR = '/root/.docker';
 const ROOT_DOCKER_CONFIG_PATH = `${ ROOT_DOCKER_CONFIG_DIR }/config.json`;
+/** Number of times to retry converting a path between WSL & Windows. */
+const WSL_PATH_CONVERT_RETRIES = 10;
 
 /**
  * Enumeration for tracking what operation the backend is undergoing.
@@ -115,18 +119,10 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
         if (this.cfg?.kubernetes.enabled) {
           const k8sPort = 6443;
-          const gatewayIP = '192.168.127.2';
-          const k8sPortForwarding = `127.0.0.1:${ k8sPort }=${ gatewayIP }:${ k8sPort }`;
+          const eth0IP = '192.168.127.2';
+          const k8sPortForwarding = `127.0.0.1:${ k8sPort }=${ eth0IP }:${ k8sPort }`;
 
           args.push('--port-forward', k8sPortForwarding);
-
-          if (this.cfg?.kubernetes.options.traefik) {
-            const ingressIP = this.cfg?.kubernetes.ingress.localhostOnly ? '127.0.0.1' : '0.0.0.0';
-
-            for (const port of [80, 443]) {
-              args.push('--port-forward', `${ ingressIP }:${ port }=${ gatewayIP }:${ port }`);
-            }
-          }
         }
 
         return childProcess.spawn(exe, args, {
@@ -136,34 +132,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       },
       shouldRun: () => Promise.resolve([State.STARTING, State.STARTED, State.DISABLED].includes(this.state)),
     });
-
-    this.resolverHostProcess = new BackgroundProcess('host-resolver vsock host', {
-      spawn: async() => {
-        const exe = path.join(paths.resources, 'win32', 'internal', 'host-resolver.exe');
-        const stream = await Logging['host-resolver-host'].fdStream;
-        const wslHostAddr = wslHostIPv4Address();
-
-        return childProcess.spawn(exe, ['vsock-host',
-          '--built-in-hosts',
-          `host.rancher-desktop.internal=${ wslHostAddr },host.docker.internal=${ wslHostAddr }`], {
-          stdio:       ['ignore', stream, stream],
-          windowsHide: true,
-        });
-      },
-      shouldRun: () => Promise.resolve([State.STARTING, State.STARTED, State.DISABLED].includes(this.state)),
-    });
-
-    if (!this.cfg?.experimental.virtualMachine.networkingTunnel) {
-      // Register a new tunnel for RD Guest Agent
-      this.vtun.addTunnel({
-        name:                  'Rancher Desktop Privileged Service',
-        handshakePort:         17382,
-        vsockHostPort:         17381,
-        peerAddress:           '127.0.0.1',
-        peerPort:              3040,
-        upstreamServerAddress: 'npipe:////./pipe/rancher_desktop/privileged_service',
-      });
-    }
 
     this.kubeBackend = kubeFactory(this);
   }
@@ -205,20 +173,12 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     return this.#isAdminInstall;
   }
 
-  /** Indicates whether privileged service is enabled in the current installation. */
-  protected privilegedServiceEnabled = false;
-
   /**
    * Reference to the _init_ process in WSL.  All other processes should be
    * children of this one.  Note that this is busybox init, running in a custom
    * mount & pid namespace.
    */
   protected process: childProcess.ChildProcess | null = null;
-
-  /**
-   * Windows-side process for the host resolver, used to proxy DNS requests via the system APIs.
-   */
-  protected resolverHostProcess: BackgroundProcess;
 
   /**
    * Windows-side process for the Rancher Desktop Networking,
@@ -249,9 +209,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   set noModalDialogs(value: boolean) {
     this.#noModalDialogs = value;
   }
-
-  /** Vtunnel Proxy management singleton. */
-  protected vtun = getVtunnelInstance();
 
   /**
    * The current operation underway; used to avoid responding to state changes
@@ -438,8 +395,13 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
               await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
               await fs.promises.writeFile(absPath, contents);
             }
-            await childProcess.spawnFile('tar.exe',
-              ['-r', '-f', archivePath, '-C', path.join(workdir, 'tar'), ...Object.keys(OVERRIDE_FILES)]);
+            // msys comes with its own "tar.exe"; ensure we use the version
+            // shipped with Windows.
+            const tarExe = path.join(process.env.SystemRoot ?? '', 'system32', 'tar.exe');
+
+            await childProcess.spawnFile(tarExe,
+              ['-r', '-f', archivePath, '-C', path.join(workdir, 'tar'), ...Object.keys(OVERRIDE_FILES)],
+              { stdio: 'pipe' });
             await this.execCommand('tar', '-tvf', await this.wslify(archivePath));
             await this.execWSL('--import', DATA_INSTANCE_NAME, paths.wslDistroData, archivePath, '--version', '2');
           } catch (ex) {
@@ -478,7 +440,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     } catch (ex) {
       console.log('Error setting up data distribution:', ex);
     } finally {
-      await fs.promises.rm(workdir, { recursive: true, force: true });
+      await fs.promises.rm(workdir, { recursive: true, maxRetries: 3 });
     }
   }
 
@@ -489,9 +451,11 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
   protected async runWslProxy() {
     const debug = this.debug ? 'true' : 'false';
+    const logDir = await this.wslify(paths.logs);
+    const logfile = path.posix.join(logDir, 'wsl-proxy.log');
 
     try {
-      await this.execCommand('/usr/local/bin/wsl-proxy', '-debug', debug);
+      await this.execCommand('/usr/local/bin/wsl-proxy', `-debug=${ debug }`, `-logfile=${ logfile }`);
     } catch (err: any) {
       console.log('Error trying to start wsl-proxy in default namespace:', err);
     }
@@ -502,9 +466,8 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
    * contents from the data distribution.
    */
   protected async writeHostsFile(config: BackendSettings) {
-    const rdNetworking = config.experimental.virtualMachine.networkingTunnel;
-    const virtualNetworkHostAddr = '192.168.127.254';
-    const hostIPAddr = rdNetworking ? virtualNetworkHostAddr : wslHostIPv4Address();
+    const virtualNetworkStaticAddr = '192.168.127.254';
+    const virtualNetworkGatewayAddr = '192.168.127.1';
 
     await this.progressTracker.action('Updating /etc/hosts', 50, async() => {
       const contents = await fs.promises.readFile(`\\\\wsl$\\${ DATA_INSTANCE_NAME }\\etc\\hosts`, 'utf-8');
@@ -513,61 +476,14 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       const hosts = ['host.rancher-desktop.internal', 'host.docker.internal'];
       const extra = [
         '# BEGIN Rancher Desktop configuration.',
-        `${ hostIPAddr } ${ hosts.join(' ') }`,
+        `${ virtualNetworkStaticAddr } ${ hosts.join(' ') }`,
+        `${ virtualNetworkGatewayAddr } gateway.rancher-desktop.internal`,
         '# END Rancher Desktop configuration.',
       ].map(l => `${ l }\n`).join('');
 
       await fs.promises.writeFile(`\\\\wsl$\\${ INSTANCE_NAME }\\etc\\hosts`,
         lines.join('\n') + extra, 'utf-8');
     });
-  }
-
-  /**
-   * start/stop Privileged Service based on a given command [start|stop],
-   * also, it returns a boolean to indicate if privileged services
-   * is enabled.
-   */
-  protected async invokePrivilegedService(cmd: 'start' | 'stop'): Promise<boolean> {
-    const privilegedServicePath = path.join(paths.resources, 'win32', 'internal', 'privileged-service.exe');
-    let privilegedServiceEnabled = true;
-
-    try {
-      await childProcess.spawnFile(privilegedServicePath, [cmd]);
-    } catch (error) {
-      privilegedServiceEnabled = false;
-    }
-
-    return privilegedServiceEnabled;
-  }
-
-  /**
-   * Return the Linux path to the host-resolver executable.
-   */
-  protected getHostResolverPeerPath(): Promise<string> {
-    return this.wslify(path.join(paths.resources, 'linux', 'internal', 'host-resolver'));
-  }
-
-  /**
-   * Write configuration for dnsmasq / and /etc/resolv.conf; required before [runInit].
-   */
-  protected async writeResolvConf() {
-    await this.progressTracker.action('Updating DNS configuration', 50,
-      // Tell dnsmasq to use the resolv.conf from the data distro as the
-      // upstream configuration.
-      Promise.all([
-        (async() => {
-          try {
-            const contents = await this.readFile(
-              '/etc/resolv.conf', { distro: DATA_INSTANCE_NAME });
-
-            await this.writeFile('/etc/dnsmasq.d/data-resolv-conf', contents);
-          } catch (ex) {
-            console.error('Failed to copy existing resolv.conf');
-            throw ex;
-          }
-        })(),
-        this.writeConf('dnsmasq', { DNSMASQ_OPTS: '--user=dnsmasq --group=dnsmasq' }),
-      ]));
   }
 
   /**
@@ -649,7 +565,17 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
    * - Figures out what the /mnt/DRIVE-LETTER path should be
    */
   async wslify(windowsPath: string, distro?: string): Promise<string> {
-    return (await this.captureCommand({ distro }, 'wslpath', '-a', '-u', windowsPath)).trimEnd();
+    for (let i = 1; i <= WSL_PATH_CONVERT_RETRIES; i++) {
+      const result: string = (await this.captureCommand({ distro }, 'wslpath', '-a', '-u', windowsPath)).trimEnd();
+
+      if (result) {
+        return result;
+      }
+      console.log(`Failed to convert '${ windowsPath }' to a wsl path, retry #${ i }`);
+      await util.promisify(setTimeout)(100);
+    }
+
+    return '';
   }
 
   protected async killStaleProcesses() {
@@ -657,7 +583,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     await Promise.all([
       this.execWSL('--terminate', INSTANCE_NAME),
       this.execWSL('--terminate', DATA_INSTANCE_NAME),
-      this.resolverHostProcess.stop(),
       this.hostSwitchProcess.stop(),
     ]);
   }
@@ -665,11 +590,11 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   /**
    * Copy a file from Windows to the WSL distribution.
    */
-  protected async wslInstall(windowsPath: string, targetDirectory: string): Promise<void> {
+  protected async wslInstall(windowsPath: string, targetDirectory: string, targetBasename = ''): Promise<void> {
     const wslSourcePath = await this.wslify(windowsPath);
     const basename = path.basename(windowsPath);
     // Don't use `path.join` or the backslashes will come back.
-    const targetFile = `${ targetDirectory }/${ basename }`;
+    const targetFile = `${ targetDirectory }/${ targetBasename || basename }`;
 
     console.log(`Installing ${ windowsPath } as ${ wslSourcePath } into ${ targetFile } ...`);
     try {
@@ -690,7 +615,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
    * @param [options] Optional configuration for reading the file.
    * @param [options.distro=INSTANCE_NAME] The distribution to read from.
    * @param [options.encoding='utf-8'] The encoding to use for the result.
-   * @param [options.resolveSymlinks=true] Whether to resolve symlinks before reading.
    */
   async readFile(filePath: string, options?: Partial<{
     distro: typeof INSTANCE_NAME | typeof DATA_INSTANCE_NAME,
@@ -702,11 +626,21 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     filePath = (await this.execCommand({ distro, capture: true }, 'busybox', 'readlink', '-f', filePath)).trim();
 
     // Run wslpath here, to ensure that WSL generates any files we need.
-    const windowsPath = (await this.execCommand({
-      distro, encoding, capture: true,
-    }, '/bin/wslpath', '-w', filePath)).trim();
+    for (let i = 1; i <= WSL_PATH_CONVERT_RETRIES; ++i) {
+      const windowsPath = (await this.execCommand({
+        distro, encoding, capture: true,
+      }, '/bin/wslpath', '-w', filePath)).trim();
 
-    return await fs.promises.readFile(windowsPath, options?.encoding ?? 'utf-8');
+      if (!windowsPath) {
+        // Failed to convert for some reason; try again.
+        await util.promisify(setTimeout)(100);
+        continue;
+      }
+
+      return await fs.promises.readFile(windowsPath, options?.encoding ?? 'utf-8');
+    }
+
+    throw new Error(`Failed to convert ${ filePath } to a Windows path.`);
   }
 
   /**
@@ -727,7 +661,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       await this.execCommand({ distro }, 'busybox', 'cp', wslScriptPath, filePath);
       await this.execCommand({ distro }, 'busybox', 'chmod', (options?.permissions ?? 0o644).toString(8), filePath);
     } finally {
-      await fs.promises.rm(workdir, { recursive: true });
+      await fs.promises.rm(workdir, { recursive: true, maxRetries: 3 });
     }
   }
 
@@ -771,7 +705,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       await this.execCommand('chmod', 'a+x', wslScriptPath);
       await this.execCommand(wslScriptPath, ...args);
     } finally {
-      await fs.promises.rm(workdir, { recursive: true });
+      await fs.promises.rm(workdir, { recursive: true, maxRetries: 3 });
     }
   }
 
@@ -789,42 +723,17 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     const credsPath = getServerCredentialsPath();
 
     try {
-      const vtunnelPeerServerAddr = '127.0.0.1:3030';
-      const credentialServerAddr = '192.168.127.254:6109';
-      // When networkTunnel is enabled we talk directly to the host which is assigned
-      // with 192.168.127.254 static address. Otherwise, we talk to the vtunnel peer
-      // which is listening in the WSL VM on 127.0.0.1:3030.
-      const credForwarderURL = this.cfg?.experimental.virtualMachine.networkingTunnel ? credentialServerAddr : vtunnelPeerServerAddr;
+      const credentialServerAddr = 'host.rancher-desktop.internal:6109';
       const stateInfo: ServerState = JSON.parse(await fs.promises.readFile(credsPath, { encoding: 'utf-8' }));
       const escapedPassword = stateInfo.password.replace(/\\/g, '\\\\')
         .replace(/'/g, "\\'");
       // leading `$` is needed to escape single-quotes, as : $'abc\'xyz'
       const leadingDollarSign = stateInfo.password.includes("'") ? '$' : '';
       const fileContents = `CREDFWD_AUTH=${ leadingDollarSign }'${ stateInfo.user }:${ escapedPassword }'
-      CREDFWD_URL='http://${ credForwarderURL }'
+      CREDFWD_URL='http://${ credentialServerAddr }'
       `;
       const defaultConfig = { credsStore: 'rancher-desktop' };
       let existingConfig: Record<string, any>;
-
-      const OldCredHelperService = '/etc/init.d/credhelper-vtunnel-peer';
-      const OldCredHelperConfd = '/etc/conf.d/credhelper-vtunnel-peer';
-
-      await this.handleUpgrade([OldCredHelperService, OldCredHelperConfd]);
-
-      await this.writeFile('/etc/init.d/vtunnel-peer', SERVICE_VTUNNEL_PEER, 0o755);
-      await this.writeConf('vtunnel-peer', {
-        VTUNNEL_PEER_BINARY: await this.getVtunnelPeerPath(),
-        LOG_DIR:             await this.wslify(paths.logs),
-        CONFIG_PATH:         await this.wslify(getVtunnelConfigPath()),
-      });
-      await this.execCommand('/sbin/rc-update', 'add', 'vtunnel-peer', 'default');
-
-      // Stop the service if RD Networking is enabled. We need to add it
-      // first as rc-service del … fails if the service is not enabled,
-      // but rc-service add … handles an already-enabled service fine.
-      if (this.cfg?.experimental.virtualMachine.networkingTunnel) {
-        await this.execCommand('/sbin/rc-update', 'del', 'vtunnel-peer', 'default');
-      }
 
       await this.execCommand('mkdir', '-p', ETC_RANCHER_DESKTOP_DIR);
       await this.writeFile(CREDENTIAL_FORWARDER_SETTINGS_PATH, fileContents, 0o644);
@@ -877,62 +786,29 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   protected async handleUpgrade(files: string[]) {
     for (const file of files) {
       try {
-        await fs.promises.rm(file, { force: true });
+        await fs.promises.rm(file, { force: true, maxRetries: 3 });
       } catch {
-        // ignore the err from exception, sice we are
+        // ignore the err from exception, since we are
         // removing renamed files from previous releases
       }
     }
   }
 
-  /**
-   * On Windows Trivy is run via WSL as there's no native port.
-   * Ensure that all relevant files are in the wsl mount, not the windows one.
-   */
-  protected async installTrivy() {
-    // download-resources.sh installed trivy into the resources area
-    // This function moves it into /usr/local/bin/ so when trivy is
-    // invoked to run through wsl, it runs faster.
-
-    const trivyExecPath = path.join(paths.resources, 'linux', 'internal', 'trivy');
-
-    await this.execCommand('mkdir', '-p', '/var/local/bin');
-    await this.wslInstall(trivyExecPath, '/usr/local/bin');
-  }
-
   protected async installGuestAgent(kubeVersion: semver.SemVer | undefined, cfg: BackendSettings | undefined) {
-    let guestAgentConfig: Record<string, any>;
     const enableKubernetes = !!kubeVersion;
-    const iptables = enableKubernetes && !K3sHelper.requiresPortForwardingFix(kubeVersion);
-    const rdNetworking = !!cfg?.experimental.virtualMachine.networkingTunnel;
+    const isAdminInstall = await this.getIsAdminInstall();
 
-    if (rdNetworking || this.privilegedServiceEnabled) {
-      guestAgentConfig = {
-        LOG_DIR:                       await this.wslify(paths.logs),
-        GUESTAGENT_ADMIN_INSTALL:      await this.getIsAdminInstall(),
-        GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
-        GUESTAGENT_IPTABLES:           iptables.toString(), // only enable IPTABLES for older K8s
-        GUESTAGENT_PRIVILEGED_SERVICE: rdNetworking ? 'false' : 'true',
-        GUESTAGENT_CONTAINERD:         cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
-        GUESTAGENT_DOCKER:             cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
-        GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
-        GUESTAGENT_K8S_SVC_ADDR:       cfg?.kubernetes.ingress.localhostOnly ? '127.0.0.1' : '0.0.0.0',
-      };
-    } else {
-      guestAgentConfig = {
-        LOG_DIR:                       await this.wslify(paths.logs),
-        GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
-        GUESTAGENT_PRIVILEGED_SERVICE: 'false',
-        GUESTAGENT_IPTABLES:           'true',
-        GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
-        GUESTAGENT_K8S_SVC_ADDR:       '127.0.0.1', // always use localhost for non-privileged installation/user
-      };
-    }
-
-    const guestAgentPath = path.join(paths.resources, 'linux', 'internal', 'rancher-desktop-guestagent');
+    const guestAgentConfig: Record<string, string> = {
+      LOG_DIR:                  await this.wslify(paths.logs),
+      GUESTAGENT_ADMIN_INSTALL: isAdminInstall ? 'true' : 'false',
+      GUESTAGENT_KUBERNETES:    enableKubernetes ? 'true' : 'false',
+      GUESTAGENT_CONTAINERD:    cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
+      GUESTAGENT_DOCKER:        cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
+      GUESTAGENT_DEBUG:         this.debug ? 'true' : 'false',
+      GUESTAGENT_K8S_SVC_ADDR:  isAdminInstall && !cfg?.kubernetes.ingress.localhostOnly ? '0.0.0.0' : '127.0.0.1',
+    };
 
     await Promise.all([
-      this.wslInstall(guestAgentPath, '/usr/local/bin/'),
       this.writeFile('/etc/init.d/rancher-desktop-guestagent', SERVICE_GUEST_AGENT_INIT, 0o755),
       this.writeConf('rancher-desktop-guestagent', guestAgentConfig),
     ]);
@@ -1034,12 +910,17 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   spawn(...command: string[]): childProcess.ChildProcess;
   spawn(options: execOptions, ...command: string[]): childProcess.ChildProcess;
   spawn(optionsOrCommand: execOptions | string, ...command: string[]): childProcess.ChildProcess {
-    const args = ['--distribution', INSTANCE_NAME, '--exec'];
+    const args = ['--distribution', INSTANCE_NAME, '--exec', '/usr/local/bin/wsl-exec'];
 
     if (typeof optionsOrCommand === 'string') {
       args.push(optionsOrCommand);
     } else {
-      throw new TypeError('Not supported yet');
+      const options: execOptions = optionsOrCommand;
+
+      // runTrivyScan() calls spawn({root: true}, …), which we ignore because we are already running as root
+      if (options.expectFailure || options.logStream || options.env) {
+        throw new TypeError('Not supported yet');
+      }
     }
     args.push(...command);
 
@@ -1055,16 +936,36 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   protected async captureCommand(...command: string[]): Promise<string>;
   protected async captureCommand(options: wslExecOptions, ...command: string[]): Promise<string>;
   protected async captureCommand(optionsOrArg: wslExecOptions | string, ...command: string[]): Promise<string> {
-    if (typeof optionsOrArg === 'string') {
-      return await this.execCommand({ capture: true }, optionsOrArg, ...command);
-    }
+    let result: string;
+    let debugArg: string;
 
-    return await this.execCommand({ ...optionsOrArg, capture: true }, ...command);
+    if (typeof optionsOrArg === 'string') {
+      result = await this.execCommand({ capture: true }, optionsOrArg, ...command);
+      debugArg = optionsOrArg;
+    } else {
+      result = await this.execCommand({ ...optionsOrArg, capture: true }, ...command);
+      debugArg = JSON.stringify(optionsOrArg);
+    }
+    console.debug(`captureCommand:\ncommand: (${ debugArg } ${ command.map(s => `'${ s }'`).join(' ') })\noutput: <${ result }>`);
+
+    return result;
   }
 
   /** Get the IPv4 address of the VM, assuming it's already up. */
   get ipAddress(): Promise<string | undefined> {
     return (async() => {
+      // When using mirrored-mode networking, 127.0.0.1 works just fine
+      // ...also, there may not even be an `eth0` to find the IP of!
+      try {
+        const networkModeString = await this.captureCommand('wslinfo', '-n', '--networking-mode');
+
+        if (networkModeString === 'mirrored') {
+          return '127.0.0.1';
+        }
+      } catch {
+        // wslinfo is missing (wsl < 2.0.4) - fall back to old behavior
+      }
+
       // We need to locate the _local_ route (netmask) for eth0, and then
       // look it up in /proc/net/fib_trie to find the local address.
       const routesString = await this.captureCommand('cat', '/proc/net/route');
@@ -1142,11 +1043,9 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
    * This manages {this.process}.
    */
   protected async runInit() {
-    // /sbin/init actually seeks to the start of the file before writing its
-    // logs, so we have to give it a unique file to avoid other logs being
-    // clobbered.
-    const stream = await Logging['wsl-init'].fdStream;
-    const PID_FILE = '/var/run/wsl-init.pid';
+    const logFile = Logging['wsl-init'];
+    const PID_FILE = '/run/wsl-init.pid';
+    const streamReaders: Promise<void>[] = [];
 
     // Delete any stale wsl-init PID file
     try {
@@ -1154,27 +1053,37 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     } catch {
     }
 
-    if (this.cfg?.experimental.virtualMachine.networkingTunnel) {
-      await this.writeFile('/usr/local/bin/wsl-init', WSL_INIT_RD_NETWORKING_SCRIPT, 0o755);
-    } else {
-      await this.writeFile('/usr/local/bin/wsl-init', WSL_INIT_SCRIPT, 0o755);
-    }
+    await this.writeFile('/usr/local/bin/wsl-init', WSL_INIT_SCRIPT, 0o755);
 
     // The process should already be gone by this point, but make sure.
     this.process?.kill('SIGTERM');
+    const env: Record<string, string> = {
+      ...process.env,
+      WSLENV:           `${ process.env.WSLENV }:DISTRO_DATA_DIRS:LOG_DIR/p:RD_DEBUG`,
+      DISTRO_DATA_DIRS: DISTRO_DATA_DIRS.join(':'),
+      LOG_DIR:          paths.logs,
+    };
+
+    if (this.debug) {
+      env.RD_DEBUG = '1';
+    }
     this.process = childProcess.spawn('wsl.exe',
       ['--distribution', INSTANCE_NAME, '--exec', '/usr/local/bin/wsl-init'],
       {
-        env: {
-          ...process.env,
-          WSLENV:           `${ process.env.WSLENV }:DISTRO_DATA_DIRS:LOG_DIR/p`,
-          DISTRO_DATA_DIRS: DISTRO_DATA_DIRS.join(':'),
-          LOG_DIR:          paths.logs,
-        },
-        stdio:       ['ignore', stream, stream],
+        env,
+        stdio:       ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
+    for (const readable of [this.process.stdout, this.process.stderr]) {
+      if (readable) {
+        readable.on('data', (chunk: Buffer | string) => {
+          logFile.log(chunk.toString().trimEnd());
+        });
+        streamReaders.push(stream.promises.finished(readable));
+      }
+    }
     this.process.on('exit', async(status, signal) => {
+      await Promise.allSettled(streamReaders);
       if ([0, null].includes(status) && ['SIGTERM', null].includes(signal)) {
         console.log('/sbin/init exited gracefully.');
         await this.stop();
@@ -1192,13 +1101,15 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
     while (true) {
       try {
-        await this.execCommand({ expectFailure: true }, 'test', '-s', PID_FILE);
+        const stdout = await this.captureCommand({ expectFailure: true }, 'cat', PID_FILE);
+
+        console.debug(`Read wsl-init.pid: ${ stdout.trim() }`);
         break;
       } catch (e) {
         console.debug(`Error testing for wsl-init.pid: ${ e } (will retry)`);
       }
       if (Date.now() - startTime > maxWaitTime) {
-        throw new Error(`Timed out after waiting for /var/run/wsl-init.pid: ${ maxWaitTime / waitTime } secs`);
+        throw new Error(`Timed out after waiting for /run/wsl-init.pid: ${ maxWaitTime / waitTime } secs`);
       }
       await util.promisify(setTimeout)(waitTime);
     }
@@ -1311,6 +1222,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     const config = this.cfg = _.defaultsDeep(clone(config_),
       { containerEngine: { name: ContainerEngine.NONE } });
     let kubernetesVersion: semver.SemVer | undefined;
+    let isDowngrade = false;
 
     await this.setState(State.STARTING);
     this.currentAction = Action.STARTING;
@@ -1321,29 +1233,29 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
           await this.ensureDistroRegistered();
           await this.upgradeDistroAsNeeded();
           await this.writeHostsFile(config);
-          await this.writeResolvConf();
         })()];
-
-        const rdNetworking = !!config?.experimental.virtualMachine.networkingTunnel;
-
-        this.privilegedServiceEnabled = rdNetworking ? false : await this.invokePrivilegedService('start');
-
-        if (!rdNetworking) {
-          await this.vtun.start();
-        }
 
         if (config.kubernetes.enabled) {
           prepActions.push((async() => {
-            [kubernetesVersion] = await this.kubeBackend.download(config);
+            [kubernetesVersion, isDowngrade] = await this.kubeBackend.download(config);
           })());
         }
 
-        await this.progressTracker.action('Preparing to start', 0, Promise.all(prepActions));
-        if (config.kubernetes.enabled && typeof (kubernetesVersion) === 'undefined') {
-          // The desired version was unavailable, and the user declined a downgrade.
-          this.setState(State.ERROR);
+        // Clear the diagnostic about not having Kubernetes versions
+        mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available: true });
 
-          return;
+        await this.progressTracker.action('Preparing to start', 0, Promise.all(prepActions));
+        if (config.kubernetes.enabled && kubernetesVersion === undefined) {
+          if (isDowngrade) {
+            // The desired version was unavailable, and the user declined a downgrade.
+            this.setState(State.ERROR);
+
+            return;
+          }
+          // The desired version was unavailable, and we couldn't find a fallback.
+          // Notify the user, and turn off Kubernetes.
+          mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available: false });
+          this.writeSetting({ kubernetes: { enabled: false } });
         }
         if (this.currentAction !== Action.STARTING) {
           // User aborted before we finished
@@ -1358,169 +1270,165 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
         const distroLock = await this.progressTracker.action('Mounting WSL data', 100, this.mountData());
 
-        const installerActions = [
-          this.progressTracker.action('Starting WSL environment', 100, async() => {
-            const rdNetworkingDNS = '192.168.127.1';
-            const logPath = await this.wslify(paths.logs);
-            const rotateConf = LOGROTATE_K3S_SCRIPT.replace(/\r/g, '')
-              .replace('/var/log', logPath);
-            const configureWASM = !!this.cfg?.experimental?.containerEngine?.webAssembly?.enabled;
+        try {
+          await this.progressTracker.action('Installing container engine', 0, Promise.all([
+            this.progressTracker.action('Starting WSL environment', 100, async() => {
+              const rdNetworkingDNS = 'gateway.rancher-desktop.internal';
+              const logPath = await this.wslify(paths.logs);
+              const rotateConf = LOGROTATE_K3S_SCRIPT.replace(/\r/g, '')
+                .replace('/var/log', logPath);
+              const configureWASM = !!this.cfg?.experimental?.containerEngine?.webAssembly?.enabled;
 
-            await Promise.all([
-              this.progressTracker.action('Installing the docker-credential helper', 10, async() => {
-                // This must run after /etc/rancher is mounted
-                await this.installCredentialHelper();
-              }),
-              this.progressTracker.action('DNS configuration', 50, async() => {
-                if (this.cfg?.experimental.virtualMachine.networkingTunnel) {
-                  console.debug(`setting DNS server to ${ rdNetworkingDNS }  for rancher desktop networking`);
-                  try {
-                    this.hostSwitchProcess.start();
-                  } catch (error) {
-                    console.error('Failed to run rancher desktop networking host-switch.exe process:', error);
-                  }
-                } else {
-                  await this.writeFile('/etc/init.d/host-resolver', SERVICE_SCRIPT_HOST_RESOLVER, 0o755);
-                  await this.writeFile('/etc/init.d/dnsmasq-generate', SERVICE_SCRIPT_DNSMASQ_GENERATE, 0o755);
-                  // As `rc-update del …` fails if the service is already not in the run level, we add
-                  // both `host-resolver` and `dnsmasq` to `default` and then delete the one we
-                  // don't actually want to ensure that the appropriate one will be active.
-                  await this.execCommand('/sbin/rc-update', 'add', 'host-resolver', 'default');
-                  await this.execCommand('/sbin/rc-update', 'add', 'dnsmasq', 'default');
-                  await this.execCommand('/sbin/rc-update', 'add', 'dnsmasq-generate', 'default');
-                  await this.writeConf('host-resolver', {
-                    RESOLVER_PEER_BINARY: await this.getHostResolverPeerPath(),
-                    LOG_DIR:              logPath,
-                  });
-                  // dnsmasq requires /var/lib/misc to exist
-                  await this.execCommand('mkdir', '-p', '/var/lib/misc');
-                  if (config.virtualMachine.hostResolver) {
-                    console.debug(`setting DNS to host-resolver`);
+              await Promise.all([
+                this.progressTracker.action('Installing the docker-credential helper', 10, async() => {
+                  // This must run after /etc/rancher is mounted
+                  await this.installCredentialHelper();
+                }),
+                this.progressTracker.action('DNS configuration', 50, () => {
+                  return new Promise<void>((resolve) => {
+                    console.debug(`setting DNS server to ${ rdNetworkingDNS } for rancher desktop networking`);
                     try {
-                      this.resolverHostProcess.start();
+                      this.hostSwitchProcess.start();
                     } catch (error) {
-                      console.error('Failed to run host-resolver vsock-host process:', error);
+                      console.error('Failed to run rancher desktop networking host-switch.exe process:', error);
                     }
-                    await this.execCommand('/sbin/rc-update', 'del', 'dnsmasq-generate', 'default');
-                    await this.execCommand('/sbin/rc-update', 'del', 'dnsmasq', 'default');
-                  } else {
-                    await this.execCommand('/sbin/rc-update', 'del', 'host-resolver', 'default');
+                    resolve();
+                  });
+                }),
+                this.progressTracker.action('Kubernetes dockerd compatibility', 50, async() => {
+                  await this.writeFile('/etc/init.d/cri-dockerd', SERVICE_SCRIPT_CRI_DOCKERD, 0o755);
+                  await this.writeConf('cri-dockerd', {
+                    ENGINE:  config.containerEngine.name,
+                    LOG_DIR: logPath,
+                  });
+                }),
+                this.progressTracker.action('Kubernetes components', 50, async() => {
+                  await this.writeFile('/etc/init.d/k3s', SERVICE_SCRIPT_K3S, 0o755);
+                  await this.writeFile('/etc/logrotate.d/k3s', rotateConf);
+                  await this.execCommand('mkdir', '-p', '/etc/cni/net.d');
+                  if (config.kubernetes.options.flannel) {
+                    await this.writeFile('/etc/cni/net.d/10-flannel.conflist', FLANNEL_CONFLIST);
                   }
+                }),
+                this.progressTracker.action('container engine components', 50, async() => {
+                  await BackendHelper.configureContainerEngine(this, configureWASM);
+                  await this.writeConf('containerd', { log_owner: 'root' });
+                  await this.writeFile('/usr/local/bin/nerdctl', NERDCTL, 0o755);
+                  await this.writeFile('/etc/init.d/docker', SERVICE_SCRIPT_DOCKERD, 0o755);
+                  await this.writeConf('docker', {
+                    WSL_HELPER_BINARY: await this.getWSLHelperPath(),
+                    LOG_DIR:           logPath,
+                  });
+                  await this.writeFile(`/etc/init.d/buildkitd`, SERVICE_BUILDKITD_INIT, 0o755);
+                  await this.writeFile(`/etc/conf.d/buildkitd`,
+                    `${ SERVICE_BUILDKITD_CONF }\nlog_file=${ logPath }/buildkitd.log\n`);
+                }),
+                this.progressTracker.action('Proxy Config Setup', 50, async() => {
+                  await this.execCommand('mkdir', '-p', '/etc/moproxy');
+                  await this.writeConf('moproxy', {
+                    MOPROXY_BINARY: await this.getMoproxyPath(),
+                    LOG_DIR:        logPath,
+                  });
+                  await this.writeFile('/etc/init.d/moproxy', SERVICE_SCRIPT_MOPROXY, 0o755);
+                  await this.writeProxySettings(config.experimental.virtualMachine.proxy);
+                }),
+                this.progressTracker.action('Configuring image proxy', 50, async() => {
+                  const allowedImagesConf = '/usr/local/openresty/nginx/conf/allowed-images.conf';
+                  const resolver = `resolver ${ rdNetworkingDNS } ipv6=off;\n`;
+
+                  await this.writeFile(`/usr/local/openresty/nginx/conf/nginx.conf`, NGINX_CONF, 0o644);
+                  await this.writeFile(`/usr/local/openresty/nginx/conf/resolver.conf`, resolver, 0o644);
+                  await this.writeFile(`/etc/logrotate.d/openresty`, LOGROTATE_OPENRESTY_SCRIPT, 0o644);
+
+                  await this.runInstallScript(CONFIGURE_IMAGE_ALLOW_LIST, 'configure-allowed-images');
+                  if (config.containerEngine.allowedImages.enabled) {
+                    const patterns = BackendHelper.createAllowedImageListConf(config.containerEngine.allowedImages);
+
+                    await this.writeFile(allowedImagesConf, patterns, 0o644);
+                  } else {
+                    await this.execCommand({ root: true }, 'rm', '-f', allowedImagesConf);
+                  }
+                  const obsoleteImageAllowListConf = path.join(path.dirname(allowedImagesConf), 'image-allow-list.conf');
+
+                  await this.execCommand({ root: true }, 'rm', '-f', obsoleteImageAllowListConf);
+                }),
+                await this.progressTracker.action('Rancher Desktop guest agent', 50, this.installGuestAgent(kubernetesVersion, this.cfg)),
+                // Remove any residual rc artifacts from previous version
+                await this.execCommand({ root: true }, 'rm', '-f', '/etc/init.d/vtunnel-peer', '/etc/runlevels/default/vtunnel-peer'),
+                await this.execCommand({ root: true }, 'rm', '-f', '/etc/init.d/host-resolver', '/etc/runlevels/default/host-resolver'),
+                await this.execCommand({ root: true }, 'rm', '-f', '/etc/init.d/dnsmasq-generate', '/etc/runlevels/default/dnsmasq-generate'),
+                await this.execCommand({ root: true }, 'rm', '-f', '/etc/init.d/dnsmasq', '/etc/runlevels/default/dnsmasq'),
+              ]);
+
+              await this.writeFile('/usr/local/bin/wsl-exec', WSL_EXEC, 0o755);
+              await this.runInit();
+              if (configureWASM) {
+                try {
+                  const version = semver.parse(DEPENDENCY_VERSIONS.spinCLI);
+                  const env = {
+                    KUBE_PLUGIN_VERSION: DEPENDENCY_VERSIONS.spinKubePlugin,
+                    SPIN_TEMPLATES_TAG:  (version ? `spin/templates/v${ version.major }.${ version.minor }` : 'unknown'),
+                  };
+                  const wslenv = Object.keys(env).join(':');
+
+                  // wsl-exec is needed to correctly resolve DNS names
+                  await this.execCommand({
+                    env: {
+                      ...process.env, ...env, WSLENV: wslenv,
+                    },
+                  }, '/usr/local/bin/wsl-exec', await this.wslify(executable('setup-spin')));
+                } catch {
+                  // just ignore any errors; all the script does is installing spin plugins and templates
                 }
-              }),
-              this.progressTracker.action('Kubernetes dockerd compatibility', 50, async() => {
-                await this.writeFile('/etc/init.d/cri-dockerd', SERVICE_SCRIPT_CRI_DOCKERD, 0o755);
-                await this.writeConf('cri-dockerd', {
-                  ENGINE:  config.containerEngine.name,
-                  LOG_DIR: logPath,
-                });
-              }),
-              this.progressTracker.action('Kubernetes components', 50, async() => {
-                await this.writeFile('/etc/init.d/k3s', SERVICE_SCRIPT_K3S, 0o755);
-                await this.writeFile('/etc/logrotate.d/k3s', rotateConf);
-                await this.execCommand('mkdir', '-p', '/etc/cni/net.d');
-                if (config.kubernetes.options.flannel) {
-                  await this.writeFile('/etc/cni/net.d/10-flannel.conflist', FLANNEL_CONFLIST);
-                }
-              }),
-              this.progressTracker.action('container engine components', 50, async() => {
-                await BackendHelper.configureContainerEngine(this, configureWASM);
-                await this.writeConf('containerd', { log_owner: 'root' });
-                await this.writeFile('/usr/local/bin/nerdctl', NERDCTL, 0o755);
-                await this.writeFile('/etc/init.d/docker', SERVICE_SCRIPT_DOCKERD, 0o755);
-                await this.writeConf('docker', {
-                  WSL_HELPER_BINARY: await this.getWSLHelperPath(),
-                  LOG_DIR:           logPath,
-                });
-                await this.writeFile(`/etc/init.d/buildkitd`, SERVICE_BUILDKITD_INIT, 0o755);
-                await this.writeFile(`/etc/conf.d/buildkitd`, SERVICE_BUILDKITD_CONF);
-              }),
-              this.progressTracker.action('Proxy Config Setup', 50, async() => {
-                await this.execCommand('mkdir', '-p', '/etc/moproxy');
-                await this.writeConf('moproxy', {
-                  MOPROXY_BINARY: await this.getMoproxyPath(),
-                  LOG_DIR:        logPath,
-                });
-                await this.writeFile('/etc/init.d/moproxy', SERVICE_SCRIPT_MOPROXY, 0o755);
-                await this.writeProxySettings(config.experimental.virtualMachine.proxy);
-              }),
-              this.progressTracker.action('Configuring image proxy', 50, async() => {
-                const allowedImagesConf = '/usr/local/openresty/nginx/conf/allowed-images.conf';
-                let resolver;
-
-                if (this.cfg?.experimental.virtualMachine.networkingTunnel) {
-                  resolver = `resolver ${ rdNetworkingDNS } ipv6=off;\n`;
-                } else {
-                  resolver = `resolver ${ await this.ipAddress } ipv6=off;\n`;
-                }
-
-                await this.writeFile(`/usr/local/openresty/nginx/conf/nginx.conf`, NGINX_CONF, 0o644);
-                await this.writeFile(`/usr/local/openresty/nginx/conf/resolver.conf`, resolver, 0o644);
-                await this.writeFile(`/etc/logrotate.d/openresty`, LOGROTATE_OPENRESTY_SCRIPT, 0o644);
-
-                await this.runInstallScript(CONFIGURE_IMAGE_ALLOW_LIST, 'configure-allowed-images');
-                if (config.containerEngine.allowedImages.enabled) {
-                  const patterns = BackendHelper.createAllowedImageListConf(config.containerEngine.allowedImages);
-
-                  await this.writeFile(allowedImagesConf, patterns, 0o644);
-                } else {
-                  await this.execCommand({ root: true }, 'rm', '-f', allowedImagesConf);
-                }
-                const obsoleteImageAllowListConf = path.join(path.dirname(allowedImagesConf), 'image-allow-list.conf');
-
-                await this.execCommand({ root: true }, 'rm', '-f', obsoleteImageAllowListConf);
-              }),
-              await this.progressTracker.action('Rancher Desktop guest agent', 50, this.installGuestAgent(kubernetesVersion, this.cfg)),
-            ]);
-
-            await this.writeFile('/usr/local/bin/wsl-exec', WSL_EXEC, 0o755);
-            await this.runInit();
-            if (rdNetworking) {
+              }
               // Do not await on this, as we don't want to wait until the proxy exits.
               this.runWslProxy().catch(console.error);
-            }
-          }),
-          this.progressTracker.action('Installing image scanner', 100, this.installTrivy()),
-          this.progressTracker.action('Installing CA certificates', 100, this.installCACerts()),
-          this.progressTracker.action('Installing helpers', 50, this.installWSLHelpers()),
-        ];
-
-        if (kubernetesVersion) {
-          const version = kubernetesVersion;
-
-          installerActions.push(
-            this.progressTracker.action('Writing K3s configuration', 50, async() => {
-              const k3sConf = {
-                PORT:                   config.kubernetes.port.toString(),
-                LOG_DIR:                await this.wslify(paths.logs),
-                'export IPTABLES_MODE': 'legacy',
-                ENGINE:                 config.containerEngine.name,
-                ADDITIONAL_ARGS:        config.kubernetes.options.traefik ? '' : '--disable traefik',
-                USE_CRI_DOCKERD:        BackendHelper.requiresCRIDockerd(config.containerEngine.name, version).toString(),
-              };
-
-              // Make sure the apiserver can be accessed from WSL through the internal gateway
-              k3sConf.ADDITIONAL_ARGS += ' --tls-san gateway.rancher-desktop.internal';
-
-              if (rdNetworking) {
-                // Add the `veth-rd1` IP address from inside the namespace
-                k3sConf.ADDITIONAL_ARGS += ' --tls-san 192.168.1.2';
-              }
-
-              if (!config.kubernetes.options.flannel) {
-                console.log(`Disabling flannel and network policy`);
-                k3sConf.ADDITIONAL_ARGS += ' --flannel-backend=none --disable-network-policy';
-              }
-
-              await this.writeConf('k3s', k3sConf);
             }),
-            this.progressTracker.action('Installing k3s', 100, async() => {
-              await this.kubeBackend.deleteIncompatibleData(version);
-              await this.kubeBackend.install(config, version, false);
-            }));
-        }
-        try {
-          await this.progressTracker.action('Running installer actions', 0, Promise.all(installerActions));
+            this.progressTracker.action('Installing CA certificates', 100, this.installCACerts()),
+            this.progressTracker.action('Installing helpers', 50, this.installWSLHelpers()),
+          ]));
+
+          if (kubernetesVersion) {
+            const version = kubernetesVersion;
+
+            // We install containerd-shims as part of the container engine installation (see
+            // BackendHelper#installContainerdShims); and we need that to finish first so that when
+            // we install Kubernetes, we can look up the set of shims in order to create
+            // RuntimeClasses for them.  (See BackendHelper#configureRuntimeClasses.)
+            await this.progressTracker.action('Installing Kubernetes', 0, Promise.all([
+              this.progressTracker.action('Writing K3s configuration', 50, async() => {
+                const k3sConf = {
+                  PORT:                   config.kubernetes.port.toString(),
+                  LOG_DIR:                await this.wslify(paths.logs),
+                  'export IPTABLES_MODE': 'legacy',
+                  ENGINE:                 config.containerEngine.name,
+                  ADDITIONAL_ARGS:        config.kubernetes.options.traefik ? '' : '--disable traefik',
+                  USE_CRI_DOCKERD:        BackendHelper.requiresCRIDockerd(config.containerEngine.name, version).toString(),
+                };
+
+                // Make sure the apiserver can be accessed from WSL through the internal gateway
+                k3sConf.ADDITIONAL_ARGS += ' --tls-san gateway.rancher-desktop.internal';
+
+                // Generate certificates for the statically defined host entries.
+                // This is useful for users connecting to the host via HTTPS.
+                k3sConf.ADDITIONAL_ARGS += ' --tls-san host.rancher-desktop.internal';
+                k3sConf.ADDITIONAL_ARGS += ' --tls-san host.docker.internal';
+
+                // Add the `veth-rd-ns` IP address from inside the namespace
+                k3sConf.ADDITIONAL_ARGS += ' --tls-san 192.168.143.1';
+
+                if (!config.kubernetes.options.flannel) {
+                  console.log(`Disabling flannel and network policy`);
+                  k3sConf.ADDITIONAL_ARGS += ' --flannel-backend=none --disable-network-policy';
+                }
+
+                await this.writeConf('k3s', k3sConf);
+              }),
+              this.progressTracker.action('Installing k3s', 100, async() => {
+                await this.kubeBackend.deleteIncompatibleData(version);
+                await this.kubeBackend.install(config, version, false);
+              })]));
+          }
         } finally {
           distroLock.kill('SIGTERM');
         }
@@ -1593,7 +1501,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       if (certs && certs.length > 0) {
         const writeStream = fs.createWriteStream(path.join(workdir, 'certs.tar'));
         const archive = tar.pack();
-        const archiveFinished = util.promisify(stream.finished)(archive);
+        const archiveFinished = util.promisify(stream.finished)(archive as any);
 
         archive.pipe(writeStream);
 
@@ -1613,7 +1521,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
           '-C', '/usr/local/share/ca-certificates/');
       }
     } finally {
-      await fs.promises.rm(workdir, { recursive: true, force: true });
+      await fs.promises.rm(workdir, { recursive: true, maxRetries: 3 });
     }
     await this.execCommand('/usr/sbin/update-ca-certificates');
   }
@@ -1689,12 +1597,17 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
       await this.progressTracker.action('Shutting Down...', 10, async() => {
         if (await this.isDistroRegistered({ runningOnly: true })) {
-          await this.stopService('k3s');
-          await this.stopService('docker');
-          await this.stopService('containerd');
-          await this.stopService('rd-openresty');
-          await this.stopService('rancher-desktop-guestagent');
-          await this.stopService('buildkitd');
+          const services = ['k3s', 'docker', 'containerd', 'rd-openresty',
+            'rancher-desktop-guestagent', 'buildkitd'];
+
+          for (const service of services) {
+            try {
+              await this.stopService(service);
+            } catch (ex) {
+              // Do not allow errors here to prevent us from stopping.
+              console.error(`Failed to stop service ${ service }:`, ex);
+            }
+          }
           try {
             await this.stopService('local');
           } catch (ex) {
@@ -1702,12 +1615,20 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
             console.error('Failed to run user provisioning scripts on stopping:', ex);
           }
         }
-        if (!this.cfg?.experimental.virtualMachine.networkingTunnel) {
-          await this.vtun.stop();
-          await this.resolverHostProcess.stop();
-          await this.invokePrivilegedService('stop');
+        const initProcess = this.process;
+
+        this.process = null;
+        if (initProcess) {
+          initProcess.kill('SIGTERM');
+          try {
+            await this.execCommand({ expectFailure: true }, '/usr/bin/killall', '/usr/local/bin/network-setup');
+          } catch (ex) {
+            // `killall` returns failure if it fails to kill (e.g. if the
+            // process does not exist); `-q` only suppresses printing any error
+            // messages.
+            console.error('Ignoring error shutting down network-setup:', ex);
+          }
         }
-        this.process?.kill('SIGTERM');
         await this.hostSwitchProcess.stop();
         if (await this.isDistroRegistered({ runningOnly: true })) {
           await this.execWSL('--terminate', INSTANCE_NAME);
@@ -1754,11 +1675,13 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     const proxy = newConfig.experimental.virtualMachine.proxy;
 
     await this.writeProxySettings(proxy);
-    if (proxy.enabled && proxy.address && proxy.port) {
-      await this.execService('moproxy', 'reload', '--ifstarted');
-      await this.startService('moproxy');
-    } else {
-      await this.stopService('moproxy');
+    if (this.currentAction === Action.NONE && this.process) {
+      if (proxy.enabled && proxy.address && proxy.port) {
+        await this.execService('moproxy', 'reload', '--ifstarted');
+        await this.startService('moproxy');
+      } else {
+        await this.stopService('moproxy');
+      }
     }
   }
 
@@ -1772,7 +1695,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     }
 
     return Promise.resolve(this.kubeBackend.requiresRestartReasons(
-      this.cfg, cfg, { 'experimental.virtualMachine.networkingTunnel': { current: this.cfg.experimental.virtualMachine.networkingTunnel } }));
+      this.cfg, cfg));
   }
 
   /**
@@ -1783,16 +1706,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     // just get WSL to do the transformation for us.
 
     return this.wslify(executable('wsl-helper-linux'), distro);
-  }
-
-  /**
-   * Return the Linux path to the vtunnel peer executable.
-   */
-  protected getVtunnelPeerPath(): Promise<string> {
-    // We need to get the Linux path to our helper executable; it is easier to
-    // just get WSL to do the transformation for us.
-
-    return this.wslify(path.join(paths.resources, 'linux', 'internal', 'vtunnel'));
   }
 
   async getFailureDetails(exception: any): Promise<FailureDetails> {

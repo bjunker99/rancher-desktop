@@ -1,4 +1,4 @@
-import { ChildProcessByStdio } from 'child_process';
+import { ChildProcessByStdio, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
@@ -12,6 +12,7 @@ import {
 
 import type { ContainerEngineClient } from '@pkg/backend/containerClient';
 import mainEvents from '@pkg/main/mainEvents';
+import { spawnFile } from '@pkg/utils/childProcess';
 import { parseImageReference } from '@pkg/utils/dockerUtils';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -43,6 +44,11 @@ type ComposeFile = {
     })[];
   }>;
   volumes?: Record<string, any>;
+};
+
+// ScriptType is any key in ExtensionMetadata.host that starts with `x-rd-`.
+type ScriptType = keyof {
+  [K in keyof Required<ExtensionMetadata>['host'] as K extends `x-rd-${ infer _U }` ? K : never]: 1;
 };
 
 const console = Logging.extensions;
@@ -218,6 +224,34 @@ export class ExtensionImpl implements Extension {
     throw new ExtensionErrorImpl(code, `${ prefix } Image is not allowed`);
   }
 
+  /**
+   * Determine the post-install or pre-uninstall script to run, if any.
+   * Returns the script executable plus arguments; the executable path is always
+   * absolute.
+   */
+  protected getScriptArgs(metadata: ExtensionMetadata, key: ScriptType): string[] | undefined {
+    const scriptData = metadata.host?.[key]?.[this.platform];
+
+    if (!scriptData) {
+      return;
+    }
+
+    const [scriptName, ...scriptArgs] = Array.isArray(scriptData) ? scriptData : [scriptData];
+    const description = {
+      'x-rd-install':   'Post-install',
+      'x-rd-uninstall': 'Pre-uninstall',
+      'x-rd-shutdown':  'Shutdown',
+    }[key];
+    const binDir = path.join(this.dir, 'bin');
+    const scriptPath = path.normalize(path.resolve(binDir, scriptName));
+
+    if (/^\.+[/\\]/.test(path.relative(binDir, scriptPath))) {
+      throw new Error(`${ description } script for ${ this.id } (${ scriptName }) not inside binaries directory`);
+    }
+
+    return [scriptPath, ...scriptArgs];
+  }
+
   async install(allowedImages: readonly string[] | undefined): Promise<boolean> {
     const metadata = await this.metadata;
 
@@ -234,13 +268,29 @@ export class ExtensionImpl implements Extension {
       await this.markInstalled(this.dir);
     } catch (ex) {
       console.error(`Failed to install extension ${ this.id }, cleaning up:`, ex);
-      await fs.promises.rm(this.dir, { recursive: true }).catch((e) => {
+      await fs.promises.rm(this.dir, { recursive: true, maxRetries: 3 }).catch((e) => {
         console.error(`Failed to cleanup extension directory ${ this.dir }`, e);
       });
       throw ex;
     }
 
     mainEvents.emit('settings-write', { application: { extensions: { installed: { [this.id]: this.version } } } });
+
+    try {
+      const [scriptPath, ...scriptArgs] = this.getScriptArgs(metadata, 'x-rd-install') ?? [];
+
+      if (scriptPath) {
+        console.log(`Running ${ this.id } post-install script: ${ scriptPath } ${ scriptArgs.join(' ') }...`);
+        await spawnFile(scriptPath, scriptArgs, { stdio: console, cwd: path.dirname(scriptPath) });
+      }
+    } catch (ex) {
+      console.error(`Ignoring error running ${ this.id } post-install script: ${ ex }`);
+    }
+
+    // Since we now run extensions in a separate session, register the protocol handler there.
+    const encodedId = Buffer.from(this.id).toString('hex');
+
+    await mainEvents.invoke('extensions/register-protocol', `persist:rdx-${ encodedId }`);
 
     console.debug(`Install ${ this.id }: install complete.`);
 
@@ -303,23 +353,24 @@ export class ExtensionImpl implements Extension {
     }));
   }
 
+  protected get platform() {
+    switch (process.platform) {
+    case 'win32':
+      return 'windows';
+    case 'linux':
+    case 'darwin':
+      return process.platform;
+    default:
+      throw new Error(`Platform ${ process.platform } is not supported`);
+    }
+  }
+
   protected async installHostExecutables(workDir: string, metadata: ExtensionMetadata): Promise<void> {
-    const plat = (() => {
-      switch (process.platform) {
-      case 'win32':
-        return 'windows';
-      case 'linux':
-      case 'darwin':
-        return process.platform;
-      default:
-        throw new Error(`Platform ${ process.platform } is not supported`);
-      }
-    })();
     const binDir = path.join(workDir, 'bin');
 
     await fs.promises.mkdir(binDir, { recursive: true });
     const binaries = metadata.host?.binaries ?? [];
-    const paths = binaries.flatMap(p => p[plat]).map(b => b?.path).filter(defined);
+    const paths = binaries.flatMap(p => p[this.platform]).map(b => b?.path).filter(defined);
 
     await Promise.all(paths.map(async(p) => {
       try {
@@ -473,13 +524,24 @@ export class ExtensionImpl implements Extension {
     }
 
     try {
+      const [scriptPath, ...scriptArgs] = this.getScriptArgs(await this.metadata, 'x-rd-uninstall') ?? [];
+
+      if (scriptPath) {
+        console.log(`Running ${ this.id } pre-uninstall script: ${ scriptPath } ${ scriptArgs.join(' ') }...`);
+        await spawnFile(scriptPath, scriptArgs, { stdio: console, cwd: path.dirname(scriptPath) });
+      }
+    } catch (ex) {
+      console.error(`Ignoring error running ${ this.id } pre-uninstall script: ${ ex }`);
+    }
+
+    try {
       await this.uninstallContainers();
     } catch (ex) {
       console.error(`Ignoring error stopping ${ this.id } containers on uninstall: ${ ex }`);
     }
 
     try {
-      await fs.promises.rm(this.dir, { recursive: true });
+      await fs.promises.rm(this.dir, { recursive: true, maxRetries: 3 });
     } catch (ex: any) {
       if ((ex as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw ex;
@@ -580,5 +642,30 @@ export class ExtensionImpl implements Extension {
 
   async readFile(sourcePath: string): Promise<string> {
     return await this.client.readFile(this.image, sourcePath, { namespace: this.extensionNamespace });
+  }
+
+  async shutdown() {
+    // Don't trigger downloading the extension if it hasn't been installed.
+    const metadata = await this._metadata;
+
+    if (!metadata) {
+      return;
+    }
+    try {
+      const [scriptPath, ...scriptArgs] = this.getScriptArgs(metadata, 'x-rd-shutdown') ?? [];
+
+      if (scriptPath) {
+        console.log(`Running ${ this.id } shutdown script: ${ scriptPath } ${ scriptArgs.join(' ') }...`);
+        // No need to wait for the script to finish here.
+        const stream = await console.fdStream;
+        const process = spawn(scriptPath, scriptArgs, {
+          detached: true, stdio: ['ignore', stream, stream], cwd: path.dirname(scriptPath), windowsHide: true,
+        });
+
+        process.unref();
+      }
+    } catch (ex) {
+      console.error(`Ignoring error running ${ this.id } post-install script: ${ ex }`);
+    }
   }
 }

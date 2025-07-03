@@ -5,8 +5,9 @@
     </h2>
     <rd-checkbox
       label="Enable Kubernetes"
-      :value="settings.kubernetes.enabled"
+      :value="hasVersions && settings.kubernetes.enabled"
       :is-locked="kubernetesLocked"
+      :disabled="!hasVersions"
       @input="handleDisableKubernetesCheckbox"
     />
     <rd-fieldset
@@ -28,9 +29,9 @@
         >
           <option
             v-for="item in recommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === unwrappedDefaultVersion"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === unwrappedDefaultVersion"
           >
             {{ versionName(item) }}
           </option>
@@ -41,11 +42,11 @@
         >
           <option
             v-for="item in nonRecommendedVersions"
-            :key="item.version.version"
-            :value="item.version.version"
-            :selected="item.version.version === unwrappedDefaultVersion"
+            :key="item.version"
+            :value="item.version"
+            :selected="item.version === unwrappedDefaultVersion"
           >
-            v{{ item.version.version }}
+            v{{ item.version }}
           </option>
         </optgroup>
       </rd-select>
@@ -92,16 +93,17 @@ import _ from 'lodash';
 import Vue from 'vue';
 import { mapGetters } from 'vuex';
 
-import { VersionEntry } from '@pkg/backend/k8s';
 import EngineSelector from '@pkg/components/EngineSelector.vue';
 import PathManagementSelector from '@pkg/components/PathManagementSelector.vue';
 import RdSelect from '@pkg/components/RdSelect.vue';
 import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import RdFieldset from '@pkg/components/form/RdFieldset.vue';
 import { defaultSettings } from '@pkg/config/settings';
-import type { ContainerEngine } from '@pkg/config/settings';
+import type { ContainerEngine, Settings } from '@pkg/config/settings';
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { highestStableVersion, VersionEntry } from '@pkg/utils/kubeVersions';
+import { RecursivePartial } from '@pkg/utils/typeUtils';
 
 export default Vue.extend({
   components: {
@@ -130,15 +132,16 @@ export default Vue.extend({
     ...mapGetters('applicationSettings', { pathManagementStrategy: 'pathManagementStrategy' }),
     /** The version that should be pre-selected as the default value. */
     defaultVersion(): VersionEntry {
-      const version = this.recommendedVersions.find(v => (v.channels ?? []).includes('stable'));
-
-      return version ?? this.recommendedVersions[0] ?? this.nonRecommendedVersions[0];
+      return highestStableVersion(this.recommendedVersions) ?? this.nonRecommendedVersions[0];
     },
     // This field is needed because the template-parser doesn't like `defaultVersion?.version.version`
     unwrappedDefaultVersion(): string {
       const wrappedSemver = this.defaultVersion;
 
-      return wrappedSemver ? wrappedSemver.version.version : '';
+      return wrappedSemver ? wrappedSemver.version : '';
+    },
+    hasVersions(): boolean {
+      return this.versions.length > 0;
     },
     /** Versions that are the tip of a channel */
     recommendedVersions(): VersionEntry[] {
@@ -165,6 +168,9 @@ export default Vue.extend({
       this.versions = versions;
       this.cachedVersionsOnly = cachedVersionsOnly;
       this.settings.kubernetes.version = this.unwrappedDefaultVersion;
+      if (!this.hasVersions) {
+        ipcRenderer.invoke('settings-write', { kubernetes: { enabled: false } });
+      }
       // Manually send the ready event here, as we do not use the normal
       // "dialog/populate" event.
       ipcRenderer.send('dialog/ready');
@@ -188,37 +194,31 @@ export default Vue.extend({
     window.removeEventListener('beforeunload', this.close);
   },
   methods: {
+    async commitChanges(settings: RecursivePartial<Settings>) {
+      try {
+        return await ipcRenderer.invoke('settings-write', settings);
+      } catch (ex) {
+        console.log(`invoke settings-write failed: `, ex);
+      }
+    },
     onChange() {
-      ipcRenderer.invoke(
-        'settings-write',
-        {
-          kubernetes:  { version: this.settings.kubernetes.version },
-          application: { pathManagementStrategy: this.pathManagementStrategy },
-        });
+      return this.commitChanges({
+        application: { pathManagementStrategy: this.pathManagementStrategy },
+        kubernetes:  {
+          version: this.settings.kubernetes.version,
+          enabled: this.settings.kubernetes.enabled && this.hasVersions,
+        },
+      });
     },
     close() {
       this.onChange();
       window.close();
     },
     onChangeEngine(desiredEngine: ContainerEngine) {
-      try {
-        ipcRenderer.invoke(
-          'settings-write',
-          { containerEngine: { name: desiredEngine } },
-        );
-      } catch (err) {
-        console.log('invoke settings-write failed: ', err);
-      }
+      return this.commitChanges({ containerEngine: { name: desiredEngine } });
     },
     handleDisableKubernetesCheckbox(value: boolean) {
-      try {
-        ipcRenderer.invoke(
-          'settings-write',
-          { kubernetes: { enabled: value } },
-        );
-      } catch (err) {
-        console.log('invoke settings-write failed: ', err);
-      }
+      return this.commitChanges({ kubernetes: { enabled: value } });
     },
     /**
      * Get the display name of a given version.
@@ -228,10 +228,10 @@ export default Vue.extend({
       const names = (version.channels ?? []).filter(ch => !/^v?\d+/.test(ch));
 
       if (names.length > 0) {
-        return `v${ version.version.version } (${ names.join(', ') })`;
+        return `v${ version.version } (${ names.join(', ') })`;
       }
 
-      return `v${ version.version.version }`;
+      return `v${ version.version }`;
     },
     setPathManagementStrategy(val: PathManagementStrategy) {
       this.$store.dispatch('applicationSettings/setPathManagementStrategy', val);

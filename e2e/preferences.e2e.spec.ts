@@ -20,18 +20,18 @@ test.describe.serial('Main App Test', () => {
   let electronApp: ElectronApplication;
   let preferencesWindow: Page;
 
-  test.beforeAll(async() => {
+  test.beforeAll(async({ colorScheme }, testInfo) => {
     createDefaultSettings();
 
-    electronApp = await startRancherDesktop(__filename);
+    electronApp = await startRancherDesktop(testInfo);
 
     page = await electronApp.firstWindow();
     await new NavPage(page).preferencesButton.click();
     preferencesWindow = await electronApp.waitForEvent('window', page => /preferences/i.test(page.url()));
   });
 
-  test.afterAll(async() => {
-    await teardown(electronApp, __filename);
+  test.afterAll(async({ colorScheme }, testInfo) => {
+    await teardown(electronApp, testInfo);
     await tool('rdctl', 'factory-reset', '--verbose');
     reopenLogs();
   });
@@ -102,12 +102,9 @@ test.describe.serial('Main App Test', () => {
     await expect(virtualMachine.tabVolumes).toHaveText('Volumes');
 
     if (os.platform() === 'darwin') {
-      await expect(virtualMachine.tabNetwork).toBeVisible();
-      await expect(virtualMachine.tabNetwork).toHaveText('Network');
       await expect(virtualMachine.tabEmulation).toBeVisible();
       await expect(virtualMachine.tabEmulation).toHaveText('Emulation');
     } else {
-      await expect(virtualMachine.tabNetwork).not.toBeVisible();
       await expect(virtualMachine.tabEmulation).not.toBeVisible();
     }
 
@@ -143,15 +140,6 @@ test.describe.serial('Main App Test', () => {
     await expect(virtualMachine.securityModel).toBeVisible();
   });
 
-  test('should render network tab on macOS', async() => {
-    test.skip(os.platform() !== 'darwin', 'Network tab only available on macOS');
-
-    const { virtualMachine } = new PreferencesPage(preferencesWindow);
-
-    await virtualMachine.tabNetwork.click();
-    await expect(virtualMachine.socketVmNet).toBeVisible();
-  });
-
   test('should render emulation tab on macOS', async() => {
     test.skip(os.platform() !== 'darwin', 'Emulation tab only available on macOS');
 
@@ -166,7 +154,7 @@ test.describe.serial('Main App Test', () => {
       await expect(virtualMachine.vz).toBeDisabled();
     } else {
       await expect(virtualMachine.vz).not.toBeDisabled();
-      await virtualMachine.vz.click();
+      await virtualMachine.vz.click({ position: { x: 10, y: 10 } });
       await expect(virtualMachine.useRosetta).toBeVisible();
 
       if (os.arch() === 'arm64') {
@@ -208,27 +196,16 @@ test.describe.serial('Main App Test', () => {
     await expect(kubernetes.kubernetesToggle).toBeVisible();
     await expect(kubernetes.kubernetesVersion).toBeVisible();
     await expect(kubernetes.kubernetesPort).toBeVisible();
-    await expect(kubernetes.traefikToggle).toBeVisible();
+    await expect(kubernetes.kubernetesOptions).toBeVisible();
   });
 
-  test('should navigate to WSL and render network tab', async() => {
+  test('should navigate to WSL and render integrations tab', async() => {
     test.skip(os.platform() !== 'win32', 'WSL nav item not available on macOS & Linux');
     const { wsl } = new PreferencesPage(preferencesWindow);
 
     await wsl.nav.click();
 
     await expect(wsl.nav).toHaveClass('preferences-nav-item active');
-
-    await expect(wsl.tabNetwork).toHaveText('Network');
-    await expect(wsl.tabIntegrations).toBeVisible();
-    await expect(wsl.tabIntegrations).toHaveText('Integrations');
-
-    await expect(wsl.networkingTunnel).toBeVisible();
-  });
-
-  test('should integrations tab', async() => {
-    test.skip(os.platform() !== 'win32', 'WSL nav item not available on macOS & Linux');
-    const { wsl } = new PreferencesPage(preferencesWindow);
 
     await wsl.tabIntegrations.click();
     await expect(wsl.wslIntegrations).toBeVisible();
@@ -320,7 +297,7 @@ test.describe.serial('Main App Test', () => {
       expect(preferencesWindow).toBeDefined();
       // Wait for the window to actually load (i.e. transition from
       // app://index.html/#/preferences to app://index.html/#/Preferences#general)
-      await preferencesWindow.waitForURL(/Preferences/);
+      await preferencesWindow.waitForURL(/Preferences#/i);
       const { containerEngine } = new PreferencesPage(preferencesWindow);
 
       await expect(containerEngine.nav).toHaveClass('preferences-nav-item active');

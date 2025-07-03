@@ -19,7 +19,7 @@ import { ContainerEngine, Settings } from '@pkg/config/settings';
 import { spawnFile } from '@pkg/utils/childProcess';
 import { Log } from '@pkg/utils/logging';
 
-import type { BrowserView, BrowserWindow } from 'electron';
+import type { BrowserWindow, WebContentsView } from 'electron';
 
 /** The top level source directory, assuming we're always running from the tree */
 const srcDir = path.dirname(path.dirname(__filename));
@@ -30,7 +30,7 @@ const rdctl = getFullPathForTool('rdctl');
 // and we don't have to deal with unintended escape-sequence processing.
 const execPath = process.execPath.replace(/\\/g, '/');
 
-const console = new Log(path.basename(__filename, '.ts'), reportAsset(__filename, 'log'));
+let console: Log;
 const NAMESPACE = 'rancher-desktop-extensions';
 
 test.describe.serial('Extensions', () => {
@@ -60,17 +60,15 @@ test.describe.serial('Extensions', () => {
       });
   }
 
-  test.beforeAll(async() => {
-    const result = await startSlowerDesktop(__filename, {
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    [app, page] = await startSlowerDesktop(testInfo, {
       containerEngine: { name: ContainerEngine.MOBY },
       kubernetes:      { enabled: false },
     });
-
-    app = result[0] as ElectronApplication;
-    page = result[1] as Page;
+    console = new Log(path.basename(__filename, '.ts'), reportAsset(testInfo, 'log'));
   });
 
-  test.afterAll(() => teardown(app, __filename));
+  test.afterAll(({ colorScheme }, testInfo) => teardown(app, testInfo));
 
   // Set things up so console messages from the UI gets logged too.
   let currentTestInfo: TestInfo;
@@ -141,7 +139,7 @@ test.describe.serial('Extensions', () => {
   });
 
   test.describe('extension API', () => {
-    let view: JSHandle<BrowserView>;
+    let view: JSHandle<WebContentsView>;
 
     test('extension UI can be loaded', async() => {
       const window: JSHandle<BrowserWindow> = await app.browserWindow(page);
@@ -153,25 +151,32 @@ test.describe.serial('Extensions', () => {
       view = await retry(async() => {
         // Evaluate script remotely to look for the appropriate BrowserView
         const result = await window.evaluateHandle((window: BrowserWindow) => {
-          for (const view of window.getBrowserViews()) {
-            if (view.webContents.mainFrame.url.startsWith('x-rd-extension://')) {
-              return view;
+          for (const view of window.contentView.children) {
+            // Because this runs in the remote window, we don't have access to
+            // imports, and therefore types; hence we can't do an `instanceof`
+            // check here.
+            if ('webContents' in view) {
+              if ((view as any).webContents.mainFrame.url.startsWith('x-rd-extension://')) {
+                return view;
+              }
             }
           }
-        }) as JSHandle<BrowserView|undefined>;
+        }) as JSHandle<WebContentsView|undefined>;
 
         // Check that the result evaluated to the view, and not undefined.
         if (await (result).evaluate(v => typeof v) === 'undefined') {
           throw new Error('Could not find extension view');
         }
 
-        return result as JSHandle<BrowserView>;
+        return result as JSHandle<WebContentsView>;
       });
 
       await view.evaluate((v, { window }) => {
-        v.webContents.addListener('console-message', (event, level, message, line, source) => {
-          const levelName = (['verbose', 'info', 'warning', 'error'])[level];
-          const outputMessage = `[${ levelName }] ${ message } @${ source }:${ line }`;
+        v.webContents.addListener('console-message', (event) => {
+          const {
+            message, level, lineNumber, sourceId,
+          } = event;
+          const outputMessage = `[${ level }] ${ message } @${ sourceId }:${ lineNumber }`;
 
           window.webContents.executeJavaScript(`console.log(${ JSON.stringify(outputMessage) })`);
         });
@@ -179,10 +184,22 @@ test.describe.serial('Extensions', () => {
     });
 
     /** evaluate a short snippet in the extension context. */
-    function evalInView(script: string): Promise<any> {
-      return view.evaluate((v, { script }) => {
-        return v.webContents.executeJavaScript(script);
+    async function evalInView(script: string): Promise<any> {
+      // view.evaluate doesn't pass rejections correctly; instead, we convert it
+      // to a resolved object, and convert it back to an rejection on the other end.
+      const { rejected, result } = await view.evaluate(async(v, { script }) => {
+        try {
+          return { rejected: false, result: await v.webContents.executeJavaScript(script) };
+        } catch (ex) {
+          return { rejected: true, result: ex };
+        }
       }, { script });
+
+      if (rejected) {
+        throw result;
+      }
+
+      return result;
     }
 
     test('exposes API endpoint', async() => {
@@ -200,7 +217,7 @@ test.describe.serial('Extensions', () => {
     });
 
     test.describe('ddClient.extension.host.cli.exec', () => {
-      const wrapperName = process.platform === 'win32' ? 'dummy.cmd' : 'dummy.sh';
+      const wrapperName = process.platform === 'win32' ? 'dummy.exe' : 'dummy.sh';
 
       test('capturing output', async() => {
         const script = `
@@ -256,6 +273,22 @@ test.describe.serial('Extensions', () => {
           errors:    [],
           exitCodes: [0],
         }));
+      });
+
+      test('bypass CORS', async() => {
+        // This is the dashboard URL; it does not have CORS set up so it would
+        // normally fail to fetch due to CORS reasons.  However, this test case
+        // checks that our CORS bypass is working.
+        const url = 'http://127.0.0.1:6120/c/local/explorer/node';
+        const script = `
+          (async () => {
+            const result = await fetch('${ url }');
+            return Object.fromEntries(result.headers.entries());
+          })()
+        `;
+        const result = await evalInView(script);
+
+        expect(result).toHaveProperty('content-type');
       });
     });
 
@@ -333,22 +366,50 @@ test.describe.serial('Extensions', () => {
 
     test.describe('ddClient.extension.vm.cli.exec', () => {
       test('capturing output', async() => {
-        const script = `
+        // `.exec()` returns an object that has methods, which cannot be passed
+        // via `webContents.executeJavaScript`; serialize it as JSON and
+        // deserialize instead.
+        const result = evalInView(`
           ddClient.extension.vm.cli.exec("/bin/echo", ["xyzzy"])
-          .then(v => JSON.stringify(v))
-        `;
-        const result = JSON.parse(await evalInView(script));
+          .then(v => JSON.parse(JSON.stringify(v)))
+        `);
 
-        expect(result).toEqual(expect.objectContaining({
+        await expect(result).resolves.toMatchObject({
           stdout: 'xyzzy\n',
           code:   0,
-        }));
+        });
+      });
+    });
+    test.describe('ddClient.extension.host.cli.exec', () => {
+      test('reject when command is not found', async() => {
+        // Errors cannot be round-tripped correctly.
+        const result = evalInView(`
+          ddClient.extension.host.cli.exec('command-not-found', [])
+          .catch(v => Promise.reject(v instanceof Error ? v.toString() : JSON.stringify(v)))
+        `);
+
+        await expect(result).rejects.toMatch(/ENOENT|The system cannot find the file specified/);
+      });
+      test('reject when command fails', async() => {
+        const command = process.platform === 'win32' ? 'dummy.exe' : 'dummy.sh';
+        // The returned exception has methods, which cannot be cloned across
+        // evalInView; we serialize it as JSON and deserialize again to remove them.
+        const result = evalInView(`
+          ddClient.extension.host.cli.exec("${ command }", ["false"])
+          .then(v => Promise.resolve(JSON.parse(JSON.stringify(v))))
+          .catch(v => Promise.reject(JSON.parse(JSON.stringify(v))))
+        `);
+
+        await expect(result).rejects.toMatchObject({
+          code: 1,
+          cmd:  expect.stringMatching(/dummy.*false/),
+        });
       });
     });
 
     test.describe('ddClient.extension.vm.service', () => {
       test('can fetch from the backend', async() => {
-        const url = '/etc/os-release';
+        const url = '/get/etc/os-release';
 
         await retry(async() => {
           const result = evalInView(`ddClient.extension.vm.service.get("${ url }")`);
@@ -357,12 +418,48 @@ test.describe.serial('Extensions', () => {
         });
       });
       test('can fetch from external sources', async() => {
-        const url = 'http://127.0.0.1:6120/LICENSES'; // dashboard
+        const url = 'http://127.0.0.1:6120/c/local/explorer/node'; // dashboard
 
         await retry(async() => {
           const result = evalInView(`ddClient.extension.vm.service.get("${ url }")`);
 
-          await expect(result).resolves.toContain('Copyright');
+          await expect(result).resolves.toContain('<title>Rancher</title>');
+        });
+      });
+      test.describe('can post values', () => {
+        test('with string body', async() => {
+          await retry(async() => {
+            const result = evalInView(`ddClient.extension.vm.service.post("/post", "hello")`);
+
+            await expect(result).resolves.toMatchObject({
+              headers: { 'Content-Type': expect.arrayContaining([expect.stringMatching(/^text\/plain\b/)]) },
+              body:    'hello',
+            });
+          });
+        });
+        test('with JSON body', async() => {
+          await retry(async() => {
+            const result = evalInView(`ddClient.extension.vm.service.post("/post", {foo: 'bar'})`);
+
+            await expect(result).resolves.toMatchObject({
+              headers: { 'Content-Type': expect.arrayContaining([expect.stringMatching(/^application\/json\b/)]) },
+              body:    JSON.stringify({ foo: 'bar' }),
+            });
+          });
+        });
+        test.describe('throws with error status', () => {
+          for (const statusCode of [400, 401, 403, 404, 451, 500, 503, 504]) {
+            for (const method of ['get', 'post']) {
+              test(`${ method } ${ statusCode }`, async() => {
+                const result = evalInView(`ddClient.extension.vm.service.${ method }("/status/${ statusCode }", {})`);
+
+                await expect(result).rejects.toMatchObject({
+                  statusCode,
+                  message: expect.stringContaining(`${ statusCode }`),
+                });
+              });
+            }
+          }
         });
       });
     });

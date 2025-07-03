@@ -102,7 +102,7 @@ describe('settings', () => {
       name: 'moby',
     },
     kubernetes: {
-      version: '1.23.15',
+      version: '1.29.15',
       enabled: true,
     },
     WSL: {
@@ -206,7 +206,7 @@ describe('settings', () => {
      * the first half of the predefined text, which causes both json and plist parsers to throw an exception.
      *
      * On Linux, system files are (currently) `/etc/rancher-desktop/{defaults,locked}.json`,
-     * while the user files are  `~/.config/rancher-desktop.defaults,locked}.json`
+     * while the user files are  `~/.config/rancher-desktop.{defaults,locked}.json`
      *
      * macOS plist files:
      * User: `~/Library/Preferences/io.rancherdesktop.profile.{defaults,locked}.plist`
@@ -267,7 +267,7 @@ describe('settings', () => {
           return new RegExp(`Error loading plist file .*/io.rancherdesktop.profile.${ basename }.plist`);
         }
 
-        return new RegExp(`Error parsing deployment profile from .*/\\.config/rancher-desktop.${ basename }.json: SyntaxError: Unexpected end of JSON input`);
+        return new RegExp(`Error parsing deployment profile from .*/\\.config/rancher-desktop.${ basename }.json: SyntaxError: Unterminated string in JSON at position`);
       }
       test('complains about invalid default values', async() => {
         mock = jest.spyOn(fs, 'readFileSync')
@@ -347,10 +347,12 @@ describe('settings', () => {
               .mockImplementation(createMocker(ProfileTypes.None, ProfileTypes.Unlocked));
             const profiles = await readDeploymentProfiles();
             const expectedDefaults = _.omit(fullDefaults, ['debug', 'ignorableTestSettings', 'diagnostics.locked']);
-            const expected = {
+            const expected: RecursivePartial<settings.Settings> = {
               version:         settings.CURRENT_SETTINGS_VERSION,
               containerEngine: {
-                name: 'moby',
+                name: settings.ContainerEngine.MOBY,
+              },
+              experimental: {
               },
               kubernetes: {
                 version: '1.25.9',
@@ -535,7 +537,7 @@ describe('settings', () => {
       };
       const expected = _.merge({}, s, { version: settings.CURRENT_SETTINGS_VERSION });
 
-      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toEqual(expected);
+      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toMatchObject(expected);
     });
 
     it('updates all old settings going back to version 1', () => {
@@ -578,12 +580,12 @@ describe('settings', () => {
         containerEngine: {
           name: settings.ContainerEngine.MOBY,
         },
-        experimental:   { virtualMachine: { socketVMNet: true } },
+        experimental: {
+        },
         kubernetes:     {},
         virtualMachine: {
-          hostResolver: true,
-          memoryInGB:   30,
-          numberCPUs:   200,
+          memoryInGB: 30,
+          numberCPUs: 200,
         },
         WSL: {
           integrations: {
@@ -615,7 +617,6 @@ describe('settings', () => {
           {
             kubernetes: {
               suppressSudo: true,
-              hostResolver: true,
               memoryInGB:   300,
               numberCPUs:   45,
               experimental: {
@@ -642,9 +643,8 @@ describe('settings', () => {
               updater:                { enabled: true },
             },
             virtualMachine: {
-              hostResolver: true,
-              memoryInGB:   300,
-              numberCPUs:   45,
+              memoryInGB: 300,
+              numberCPUs: 45,
             },
             experimental: {
               virtualMachine: {
@@ -748,6 +748,18 @@ describe('settings', () => {
                 },
               },
             },
+          },
+        ],
+        11: [
+          {
+            experimental: {
+              virtualMachine: {
+                socketVMNet: true,
+              },
+            },
+          },
+          {
+            experimental: {},
           },
         ],
       };

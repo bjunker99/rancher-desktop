@@ -11,25 +11,26 @@ import { NavPage } from '../e2e/pages/nav-page';
 import { PreferencesPage } from '../e2e/pages/preferences';
 import { clearUserProfile } from '../e2e/utils/ProfileUtils';
 import {
-  createDefaultSettings, setUserProfile, reportAsset, retry, teardown, tool,
+  createDefaultSettings, setUserProfile, retry, teardown, tool, startRancherDesktop, reportAsset,
 } from '../e2e/utils/TestUtils';
 
 import { ContainerEngine, CURRENT_SETTINGS_VERSION } from '@pkg/config/settings';
+import { Log } from '@pkg/utils/logging';
 
-import type { ElectronApplication, BrowserContext, Page } from '@playwright/test';
+import type { ElectronApplication, Page } from '@playwright/test';
 
 const isWin = os.platform() === 'win32';
 const isMac = os.platform() === 'darwin';
+let console: Log;
 
 test.describe.serial('Main App Test', () => {
   let electronApp: ElectronApplication;
-  let context: BrowserContext;
   let page: Page;
   let navPage: NavPage;
   let screenshot: MainWindowScreenshots;
   const afterCheckedTimeout = 200;
 
-  test.beforeAll(async({ colorScheme }) => {
+  test.beforeAll(async({ colorScheme }, testInfo) => {
     createDefaultSettings({
       application:     { updater: { enabled: false } },
       containerEngine: {
@@ -44,25 +45,12 @@ test.describe.serial('Main App Test', () => {
       {},
     );
 
-    electronApp = await _electron.launch({
-      args: [
-        path.join(__dirname, '../'),
-        '--disable-gpu',
-        '--whitelisted-ips=',
-        '--disable-dev-shm-usage',
-        '--no-modal-dialogs',
-      ],
-      env: {
-        ...process.env,
-        RD_LOGS_DIR: reportAsset(__filename, 'log'),
-      },
-    });
-    context = electronApp.context();
+    electronApp = await startRancherDesktop(testInfo, { mock: false });
+    console = new Log(path.basename(__filename, '.ts'), reportAsset(testInfo, 'log'));
 
-    await context.tracing.start({ screenshots: true, snapshots: true });
     page = await electronApp.firstWindow();
     navPage = new NavPage(page);
-    screenshot = new MainWindowScreenshots(page, { directory: `${ colorScheme }/main` });
+    screenshot = new MainWindowScreenshots(page, { directory: `${ colorScheme }/main`, log: console });
 
     await page.emulateMedia({ colorScheme });
 
@@ -71,7 +59,7 @@ test.describe.serial('Main App Test', () => {
     await page.waitForTimeout(2500);
 
     await retry(async() => {
-      await tool('rdctl', 'extension', 'install', 'ghcr.io/rancher-sandbox/epinio-desktop-extension');
+      await tool('rdctl', 'extension', 'install', 'splatform/epinio-docker-desktop');
     }, { tries: 5 });
     await retry(async() => {
       await tool('rdctl', 'extension', 'install', 'docker/logs-explorer-extension');
@@ -82,12 +70,12 @@ test.describe.serial('Main App Test', () => {
     await expect(navExtension).toBeVisible({ timeout: 30000 });
   });
 
-  test.afterAll(async({ colorScheme }) => {
+  test.afterAll(async({ colorScheme }, testInfo) => {
     await clearUserProfile();
-    await tool('rdctl', 'extension', 'uninstall', 'ghcr.io/rancher-sandbox/epinio-desktop-extension');
+    await tool('rdctl', 'extension', 'uninstall', 'splatform/epinio-docker-desktop');
     await tool('rdctl', 'extension', 'uninstall', 'docker/logs-explorer-extension');
 
-    return teardown(electronApp, __filename);
+    return teardown(electronApp, testInfo);
   });
 
   test.describe('Main Page', () => {
@@ -204,7 +192,7 @@ test.describe.serial('Main App Test', () => {
       preferencesPage = electronApp.windows()[1];
       await preferencesPage.emulateMedia({ colorScheme });
       e2ePreferences = new PreferencesPage(preferencesPage);
-      prefScreenshot = new PreferencesScreenshots(preferencesPage, e2ePreferences, { directory: `${ colorScheme }/preferences` });
+      prefScreenshot = new PreferencesScreenshots(preferencesPage, e2ePreferences, { directory: `${ colorScheme }/preferences`, log: console });
     });
 
     test.afterAll(async({ colorScheme }) => {
@@ -281,12 +269,6 @@ test.describe.serial('Main App Test', () => {
       test.describe('Mac only tests', () => {
         test.skip(!isMac, 'Mac only test');
 
-        test('NetworkTab', async() => {
-          await e2ePreferences.virtualMachine.tabNetwork.click();
-          await expect(e2ePreferences.virtualMachine.socketVmNet).toBeVisible();
-          await prefScreenshot.take('virtualMachine', 'tabNetwork');
-        });
-
         test('EmulationTab', async() => {
           await e2ePreferences.virtualMachine.tabEmulation.click();
           await expect(e2ePreferences.virtualMachine.vmType).toBeVisible();
@@ -358,7 +340,8 @@ test.describe.serial('Main App Test', () => {
       preferencesPage = electronApp.windows()[1];
       await preferencesPage.emulateMedia({ colorScheme });
       e2ePreferences = new PreferencesPage(preferencesPage);
-      prefScreenshot = new PreferencesScreenshots(preferencesPage, e2ePreferences, { directory: `${ colorScheme }/preferences` });
+      prefScreenshot = new PreferencesScreenshots(preferencesPage, e2ePreferences,
+        { directory: `${ colorScheme }/preferences`, log: console });
     });
 
     test.afterAll(async({ colorScheme }) => {
@@ -383,5 +366,37 @@ test.describe.serial('Main App Test', () => {
       await preferencesPage.waitForTimeout(250);
       await prefScreenshot.take('kubernetes', 'lockedFields');
     });
+  });
+
+  test('Intro Image', async({ colorScheme }) => {
+    await navPage.navigateTo('General');
+    const bounds = await navPage.page.evaluate(() => {
+      window.resizeTo(1024, 768);
+
+      return {
+        top: window.screenTop, left: window.screenLeft, width: window.outerWidth, height: window.outerHeight,
+      };
+    });
+
+    await navPage.preferencesButton.click();
+    await electronApp.waitForEvent('window', page => /preferences/i.test(page.url()));
+    const preferencesPage = electronApp.windows()[1];
+
+    await preferencesPage.evaluate((bounds) => {
+      const {
+        top, left, width, height,
+      } = bounds;
+
+      window.moveTo(left + (width - window.outerWidth) / 2, top + (height - window.outerHeight) / 2);
+    }, bounds);
+
+    try {
+      await preferencesPage.emulateMedia({ colorScheme });
+      await preferencesPage.waitForTimeout(250);
+      await preferencesPage.bringToFront();
+      await screenshot.take('intro', true);
+    } finally {
+      preferencesPage.close({ runBeforeUnload: true });
+    }
   });
 });

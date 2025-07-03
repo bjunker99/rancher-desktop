@@ -1,5 +1,5 @@
 /*
-Copyright © 2022 SUSE LLC
+Copyright © 2025 SUSE LLC
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,15 +21,21 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
-	p "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/text/encoding/unicode"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/lima"
+	p "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/wsl"
 )
 
 // shellCmd represents the shell command
@@ -61,35 +67,56 @@ func init() {
 
 func doShellCommand(cmd *cobra.Command, args []string) error {
 	cmd.SilenceUsage = true
-	var commandName string
+
+	commandName, err := directories.GetLimactlPath()
+	if err != nil {
+		return err
+	}
+
 	if runtime.GOOS == "windows" {
-		commandName = "wsl"
-		distroName := "rancher-desktop"
-		if !checkWSLIsRunning(distroName) {
+		distroNames := []string{wsl.DistributionName}
+		found := false
+
+		if _, err = os.Stat(commandName); err == nil {
+			// If limactl is available, try the lima distribution first.
+			distroNames = append([]string{lima.InstanceFullName}, distroNames...)
+		}
+
+		for _, distroName := range distroNames {
+			err = assertWSLIsRunning(distroName)
+			if err == nil {
+				commandName = "wsl"
+				args = append([]string{
+					"--distribution", distroName,
+					"--exec", "/usr/local/bin/wsl-exec",
+				}, args...)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// We did not find a running distribution that we can use.
 			// No further output wanted, so just exit with the desired status.
+			fmt.Fprintf(os.Stderr, "%s", err)
 			os.Exit(1)
 		}
-		args = append([]string{
-			"--distribution", distroName,
-			"--exec", "/usr/local/bin/wsl-exec"},
-			args...)
 	} else {
 		paths, err := p.GetPaths()
 		if err != nil {
 			return err
 		}
-		if err = directories.SetupLimaHome(paths.AppHome); err != nil {
+		if err := directories.SetupLimaHome(paths.AppHome); err != nil {
 			return err
 		}
-		commandName, err = directories.GetLimactlPath()
-		if err != nil {
+		if err := setupPathEnvVar(paths); err != nil {
 			return err
 		}
 		if !checkLimaIsRunning(commandName) {
 			// No further output wanted, so just exit with the desired status.
 			os.Exit(1)
 		}
-		args = append([]string{"shell", "0"}, args...)
+		args = append([]string{"shell", lima.InstanceName}, args...)
 	}
 	shellCommand := exec.Command(commandName, args...)
 	shellCommand.Stdin = os.Stdin
@@ -98,13 +125,29 @@ func doShellCommand(cmd *cobra.Command, args []string) error {
 	return shellCommand.Run()
 }
 
+// Set up the PATH environment variable for limactl.
+func setupPathEnvVar(paths *p.Paths) error {
+	if runtime.GOOS != "windows" {
+		// This is only needed on Windows.
+		return nil
+	}
+	msysDir := filepath.Join(utils.GetParentDir(paths.Resources, 2), "msys")
+	pathList := filepath.SplitList(os.Getenv("PATH"))
+	if slices.Contains(pathList, msysDir) {
+		return nil
+	}
+	pathList = append([]string{msysDir}, pathList...)
+	return os.Setenv("PATH", strings.Join(pathList, string(os.PathListSeparator)))
+}
+
 const restartDirective = "Either run 'rdctl start' or start the Rancher Desktop application first"
 
 func checkLimaIsRunning(commandName string) bool {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	cmd := exec.Command(commandName, "ls", "0", "--format", "{{.Status}}")
+	//nolint:gosec // The command name is auto-detected, and the instance name is constant.
+	cmd := exec.Command(commandName, "ls", lima.InstanceName, "--format", "{{.Status}}")
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -122,9 +165,9 @@ func checkLimaIsRunning(commandName string) bool {
 		return false
 	}
 	errorMsg := stderr.String()
-	if strings.Contains(errorMsg, "No instance matching 0 found.") {
+	if strings.Contains(errorMsg, fmt.Sprintf("No instance matching %s found.", lima.InstanceName)) {
 		logrus.Errorf("The Rancher Desktop VM needs to be created.\n%s.\n", restartDirective)
-	} else if len(errorMsg) > 0 {
+	} else if errorMsg != "" {
 		fmt.Fprintln(os.Stderr, errorMsg)
 	} else {
 		fmt.Fprintln(os.Stderr, "Underlying limactl check failed with no output.")
@@ -132,18 +175,18 @@ func checkLimaIsRunning(commandName string) bool {
 	return false
 }
 
-func checkWSLIsRunning(distroName string) bool {
+// Check that WSL is running the given distribution; if not, an error will be
+// returned with a message suitable for printing to the user.
+func assertWSLIsRunning(distroName string) error {
 	// Ignore error messages; none are expected here
 	rawOutput, err := exec.Command("wsl", "--list", "--verbose").CombinedOutput()
 	if err != nil {
-		logrus.Errorf("Failed to run 'wsl --list --verbose': %s\n", err)
-		return false
+		return fmt.Errorf("failed to run `wsl --list --verbose: %w", err)
 	}
 	decoder := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
 	output, err := decoder.Bytes(rawOutput)
 	if err != nil {
-		logrus.Errorf("Failed to read WSL output ([% q]...); error: %s\n", rawOutput[:12], err)
-		return false
+		return fmt.Errorf("failed to read WSL output ([% q]...); error: %w", rawOutput[:12], err)
 	}
 	isListed := false
 	targetState := ""
@@ -158,15 +201,12 @@ func checkWSLIsRunning(distroName string) bool {
 			break
 		}
 	}
-	if targetState == "Running" {
-		return true
+	const desiredState = "Running"
+	if targetState == desiredState {
+		return nil
 	}
 	if !isListed {
-		fmt.Fprintf(os.Stderr,
-			"The Rancher Desktop WSL needs to be running in order to execute 'rdctl shell', but it currently is not.\n%s.\n", restartDirective)
-		return false
+		return fmt.Errorf("the Rancher Desktop WSL distribution needs to be running in order to execute 'rdctl shell', but it currently is not.\n%s", restartDirective)
 	}
-	fmt.Fprintf(os.Stderr,
-		"The Rancher Desktop WSL needs to be in state \"Running\" in order to execute 'rdctl shell', but it is currently in state \"%s\".\n%s.\n", targetState, restartDirective)
-	return false
+	return fmt.Errorf("the Rancher Desktop WSL distribution needs to be in state %q in order to execute 'rdctl shell', but it is currently in state %q.\n%s", desiredState, targetState, restartDirective)
 }

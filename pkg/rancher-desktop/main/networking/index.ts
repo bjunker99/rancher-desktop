@@ -19,30 +19,27 @@ import { windowMapping } from '@pkg/window';
 const console = Logging.networking;
 
 export default async function setupNetworking() {
-  const session = Electron.session.defaultSession;
-  const httpsOptions: https.AgentOptions = { ...https.globalAgent.options };
+  const agentOptions = { ...https.globalAgent.options };
 
-  if (!Array.isArray(httpsOptions.ca)) {
-    httpsOptions.ca = httpsOptions.ca ? [httpsOptions.ca] : [];
+  if (!Array.isArray(agentOptions.ca)) {
+    agentOptions.ca = agentOptions.ca ? [agentOptions.ca] : [];
   }
   try {
     for await (const cert of getSystemCertificates()) {
-      httpsOptions.ca.push(cert);
+      agentOptions.ca.push(cert);
     }
   } catch (ex) {
     console.error('Error getting system certificates:', ex);
     throw ex;
   }
 
-  const httpAgent = new ElectronProxyAgent(httpsOptions, session);
+  const proxyAgent = new ElectronProxyAgent({
+    httpAgent:  new http.Agent(agentOptions),
+    httpsAgent: new https.Agent(agentOptions),
+  });
 
-  httpAgent.protocol = 'http:';
-  http.globalAgent = httpAgent;
-
-  const httpsAgent = new ElectronProxyAgent(httpsOptions, session);
-
-  httpsAgent.protocol = 'https:';
-  https.globalAgent = httpsAgent;
+  http.globalAgent = proxyAgent;
+  https.globalAgent = proxyAgent;
 
   // Set up certificate handling for system certificates on Windows and macOS
   Electron.app.on('certificate-error', async(event, webContents, url, error, certificate, callback) => {
@@ -65,7 +62,7 @@ export default async function setupNetworking() {
       pluginDevUrls.some(x => url.startsWith(x))
     ) {
       event.preventDefault();
-      // eslint-disable-next-line node/no-callback-literal
+
       callback(true);
 
       return;
@@ -73,7 +70,7 @@ export default async function setupNetworking() {
 
     if (dashboardUrls.some(x => url.startsWith(x)) && 'dashboard' in windowMapping) {
       event.preventDefault();
-      // eslint-disable-next-line node/no-callback-literal
+
       callback(true);
 
       return;
@@ -90,7 +87,7 @@ export default async function setupNetworking() {
           // an attacker generating a cert with the same serial.
           if (cert === certificate.data.replace(/\r/g, '')) {
             console.log(`Accepting system certificate for ${ certificate.subjectName } (${ certificate.fingerprint })`);
-            // eslint-disable-next-line node/no-callback-literal
+
             callback(true);
 
             return;
@@ -103,7 +100,6 @@ export default async function setupNetworking() {
 
     console.log(`Not handling certificate error ${ error } for ${ url }`);
 
-    // eslint-disable-next-line node/no-callback-literal
     callback(false);
   });
 

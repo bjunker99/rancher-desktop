@@ -5,6 +5,8 @@
 # TESTS The set of tests to run (e.g. "*", "containers k8s")
 # PLATFORMS The set of platforms (e.g. "linux mac")
 # ENGINES The set of engines (e.g. "containerd moby")
+# KUBERNETES_VERSION The default Kubernetes version to use
+# KUBERNETES_ALT_VERSION Alternative Kubernetes version for coverage
 # The working directory must be the "bats/tests/" folder
 
 import dataclasses
@@ -13,10 +15,11 @@ import json
 from operator import attrgetter
 import os
 import sys
-from typing import Iterator, List, Literal, Protocol, Union
+from typing import Iterator, List, Literal, get_args
 
 Platforms = Literal["linux", "mac", "win"]
-Hosts = Literal["ubuntu-latest", "macos-12", "windows-latest"]
+Hosts = Literal["ubuntu-latest", "macos-13", "windows-latest"]
+Engines = Literal["containerd", "moby"]
 
 @dataclasses.dataclass
 class Result:
@@ -26,7 +29,11 @@ class Result:
     # The name of the test; either a directory or a file name (without extension)
     name: str
     host: Hosts
-    engine: Literal["containerd", "moby"]
+    engine: Engines
+    # The version of k3s to test
+    k3sVersion: str
+    # A different Kubernetes version, for testing upgrades.
+    k3sAltVersion: str
 
     key = staticmethod(attrgetter("name", "host", "engine"))
 
@@ -49,7 +56,7 @@ def skip_test(test: Result) -> bool:
     Check if a given test should be skipped.
     We skip some tests because the CI machines can't handle them.
     """
-    if test.host == "macos-12" and test.name.startswith("k8s/"):
+    if test.host == "macos-13" and test.name.startswith("k8s/"):
         # The macOS CI runners are slow; skip some tests that can be tested on
         # other OSes.
         skipped_tests = ("verify-cached-images",)
@@ -60,25 +67,40 @@ def skip_test(test: Result) -> bool:
 results: List[Result] = list()
 errors: bool = False
 
-for test in os.environ.get("TESTS", "*").split():
-    platforms: List[Platforms] = os.environ.get("PLATFORMS", "linux mac").split()
-    engines: List[Literal["containerd", "moby"]] = os.environ.get("ENGINES", "contained moby").split()
+for test in (os.environ.get("TESTS", None) or "*").split():
+    platforms: List[Platforms] = os.environ.get("PLATFORMS", "").split() or get_args(Platforms)
+    engines: List[Engines] = os.environ.get("ENGINES", "").split() or get_args(Engines)
     for platform in platforms:
       host: Hosts = {
          "linux": "ubuntu-latest",
-         "mac": "macos-12",
+         "mac": "macos-13",
          "win": "windows-latest",
       }[platform]
       for name in resolve_test(test, platform):
           for engine in engines:
             if os.access(name, os.R_OK):
-              result = Result(name=name, host=host, engine=engine)
+              pass
             elif os.access(f"{name}.bats", os.R_OK):
-              result = Result(name=name, host=host, engine=engine)
+              name = f"{name}.bats"
             else:
               errors = True
               print(f"Failed to find test {name}", file=sys.stderr)
               continue
+
+            # To get some coverage of different Kubernetes versions, pick the
+            # version depending on the container engine; one gets the old version
+            # we previously tested, the other gets the maximum version
+            # of k3s that is supported by the Rancher helm chart.  These values
+            # come from the environment.
+            k3sVersion = os.environ.get("KUBERNETES_VERSION", "")
+            k3sAltVersion = os.environ.get("KUBERNETES_ALT_VERSION", "")
+            if k3sVersion == "" or k3sAltVersion == "":
+               raise "Either KUBERNETES_VERSION or KUBERNETES_ALT_VERSION is unset"
+            if engine == "containerd":
+              (k3sAltVersion, k3sVersion) = (k3sVersion, k3sAltVersion)
+
+            result = Result(name=name, host=host, engine=engine,
+                            k3sVersion=k3sVersion, k3sAltVersion=k3sAltVersion)
             if not skip_test(result):
                 results.append(result)
 

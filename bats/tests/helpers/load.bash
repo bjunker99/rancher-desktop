@@ -71,7 +71,8 @@ source "$PATH_BATS_HELPERS/profile.bash"
 # rdctl from commands.bash, and jq_output from utils.bash
 source "$PATH_BATS_HELPERS/vm.bash"
 
-# Use Linux utilities (like jq) on WSL
+# Add BATS helper executables to $PATH.  On Windows, we use the Linux version
+# from WSL.
 export PATH="$PATH_BATS_ROOT/bin/${OS/windows/linux}:$PATH"
 
 # If called from foo() this function will call local_foo() if it exist.
@@ -84,6 +85,15 @@ call_local_function() {
 }
 
 setup_file() {
+    # We require bash 4; bash 3.2 (as shipped by macOS) seems to have
+    # compatibility issues.
+    if semver_gt 4.0.0 "$(semver "$BASH_VERSION")"; then
+        fail "Bash 4.0.0 is required; you have $BASH_VERSION"
+    fi
+    # We currently use a submodule that provides BATS 1.10; we do not test
+    # against any other copy of BATS (and therefore only support the version in
+    # that submodule).
+    bats_require_minimum_version 1.10.0
     # Ideally this should be printed only when using the tap formatter,
     # but I don't see a way to check for this.
     echo "# ===== $RD_TEST_FILENAME =====" >&3

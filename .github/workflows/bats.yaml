@@ -23,10 +23,24 @@ on:
         description: Container engines to run
         default: 'containerd moby'
         type: string
+      kubernetes-version:
+        description: Primary Kubernetes version to test
+        default: '1.22.7' # Must also change in calculate step
+        type: string
+      kubernetes-alt-version:
+        description: Secondary Kubernetes version to test (e.g. for upgrades)
+        default: '1.28.11' # Must also change in calculate step
+        type: string
       package-id:
         description: Package run ID override; leave empty to use latest.
         default: ''
         type: string
+      experimental:
+        description: Run with experimental settings (WSL)
+        default: false
+        type: boolean
+  schedule:
+  - cron: '0 8 * * 1-5' # 8AM UTC weekdays as a baseline
 
 permissions:
   contents: read
@@ -42,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Fetch install script
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
         sparse-checkout-cone-mode: false
@@ -50,33 +64,41 @@ jobs:
           scripts/install-latest-ci.sh
           .github/workflows/bats/get-tests.py
 
+    - id: repo
+      name: Calculate short repository
+      run: echo "repo=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
     - name: Fetch tests
       run: |
         : ${OWNER:=$GH_OWNER}
         : ${REPO:=${GH_REPOSITORY#$GH_OWNER/}}
         : ${BRANCH:=$GH_REF_NAME}
         # If BRANCH is a number, assume it is supposed to be a PR
-        [[ $BRANCH =~ ^[0-9]+$ ]] && PR=$BRANCH
+        [[ $BRANCH =~ ^[0-9]+$ ]] && export PR=$BRANCH
         "scripts/install-latest-ci.sh"
       env:
         GH_TOKEN:     ${{ github.token }}
-        OWNER:        ${{ inputs.owner }}
-        REPO:         ${{ inputs.repo }}
-        BRANCH:       ${{ inputs.branch }}
+        OWNER:        ${{ inputs.owner || github.repository_owner }}
+        REPO:         ${{ inputs.repo || steps.repo.outputs.repo }}
+        BRANCH:       ${{ inputs.branch || github.ref_name }}
         ID:           ${{ inputs.package-id }}
         BATS_DIR:     ${{ github.workspace }}/bats
-        SKIP_INSTALL: true
+        INSTALL_MODE: skip
 
     - name: Calculate tests
       id: calculate
       # This script is not inline to make local testing easier
       run: python3 ${{ github.workspace }}/.github/workflows/bats/get-tests.py
       env:
-        TESTS: ${{ inputs.tests }}
-        PLATFORMS: ${{ inputs.platforms }}
-        ENGINES: ${{ inputs.engines }}
+        TESTS:                  ${{ inputs.tests }}
+        PLATFORMS:              ${{ inputs.platforms }}
+        ENGINES:                ${{ inputs.engines }}
+        KUBERNETES_VERSION:     ${{ inputs.kubernetes-version || '1.22.7' }}
+        # rancher/rancher helm chart 2.8.5 supports up to 1.28.*
+        KUBERNETES_ALT_VERSION: ${{ inputs.kubernetes-alt-version || '1.28.11' }}
       working-directory: bats/tests
     outputs:
+      repo: ${{ steps.repo.outputs.repo }}
       tests: ${{ steps.calculate.outputs.tests }}
 
   bats:
@@ -88,12 +110,13 @@ jobs:
     runs-on: ${{ matrix.host }}
     steps:
     - name: Fetch install script
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
         sparse-checkout-cone-mode: false
         sparse-checkout: |
           scripts/install-latest-ci.sh
+          .github/actions/setup-environment/action.yaml
           .github/workflows/bats/sanitize-artifact-name.sh
 
     - name: Install latest CI build
@@ -102,75 +125,77 @@ jobs:
         : ${REPO:=${GH_REPOSITORY#$GH_OWNER/}}
         : ${BRANCH:=$GH_REF_NAME}
         # If BRANCH is a number, assume it is supposed to be a PR
-        [[ $BRANCH =~ ^[0-9]+$ ]] && PR=$BRANCH
+        [[ $BRANCH =~ ^[0-9]+$ ]] && export PR=$BRANCH
         scripts/install-latest-ci.sh
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
-        OWNER:    ${{ inputs.owner }}
-        REPO:     ${{ inputs.repo }}
-        BRANCH:   ${{ inputs.branch }}
-        ID:       ${{ inputs.package-id }}
-        BATS_DIR: ${{ github.workspace }}/bats
-        ZIP_NAME: ${{ github.workspace }}/version.txt
+        GH_TOKEN:     ${{ github.token }}
+        OWNER:        ${{ inputs.owner || github.repository_owner }}
+        REPO:         ${{ inputs.repo || needs.get-tests.outputs.repo }}
+        BRANCH:       ${{ inputs.branch || github.ref_name }}
+        ID:           ${{ inputs.package-id }}
+        BATS_DIR:     ${{ github.workspace }}/bats
+        INSTALL_MODE: installer
+        ZIP_NAME:     ${{ github.workspace }}/version.txt
+        RD_LOCATION:  system
 
-    - name: "Linux: Enable KVM access"
+    - name: Set up environment
+      uses: ./.github/actions/setup-environment
+
+    - name: "Linux: Install prerequisites"
       if: runner.os == 'Linux'
-      run: sudo chmod a+rwx /dev/kvm
-
-    - name: "Windows: Stop unwanted services"
-      if: runner.os == 'Windows'
       run: >-
-        Get-Service -ErrorAction Continue -Name
-        @('W3SVC', 'docker')
-        | Stop-Service
+        sudo DEBIAN_FRONTEND=noninteractive
+        apt-get install coreutils
 
-    - name: "Windows: Update any pre-installed WSL"
-      if: runner.os == 'Windows'
-      run: wsl --update
-      continue-on-error: true
+    - name: "macOS: Install prerequisites"
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install --force bash coreutils
 
     - name: "Windows: Install WSL2 Distribution"
       if: runner.os == 'Windows'
+      shell: powershell # pwsh doesn't have Add-AppxPackage
       run: |
-        # Set the default WSL version (we don't work with WSL1)
-        wsl --set-default-version 2
-        # Install Debian, but do not launch it
-        wsl --install Debian --no-launch
+        # `wsl --install` seems to have issues in CI since 2024-06-14; however,
+        # manually downloading the Debian installer and running it works.
+        Invoke-WebRequest https://github.com/microsoft/WSL/raw/master/distributions/DistributionInfo.json |
+          Select-Object -ExpandProperty Content |
+          ConvertFrom-JSON |
+          Select-Object -ExpandProperty Distributions |
+          Where-Object Name -EQ "Debian" |
+          Select-Object -ExpandProperty Amd64PackageUrl |
+          % { Invoke-WebRequest $_ -OutFile Debian.AppxBundle }
+        Add-AppxPackage Debian.AppxBundle
         # Initialize Debian, without going through any first-time setup
         debian.exe install --root
-      shell: pwsh
 
     - name: "Windows: Install prerequisites in WSL"
       if: runner.os == 'Windows'
+      shell: pwsh
       run: >-
         wsl.exe -d Debian --exec /usr/bin/env DEBIAN_FRONTEND=noninteractive
-        sh -c 'apt-get update && apt-get install --yes curl'
+        sh -c 'apt-get update && apt-get install --yes bsdextrautils coreutils curl'
 
-    - name: "Linux: Initialize pass"
-      if: runner.os == 'Linux'
+    - name: "Windows: Enable experimental WSL settings"
+      if: runner.os == 'Windows' && inputs.experimental
+      shell: pwsh
       run: |
-        # Configure the agent to allow default passwords
-        HOMEDIR="$(gpgconf --list-dirs homedir)" # spellcheck-ignore-line
-        mkdir -p "${HOMEDIR}"
-        chmod 0700 "${HOMEDIR}"
-        echo "allow-preset-passphrase" >> "${HOMEDIR}/gpg-agent.conf"
-
-        # Create a GPG key
-        gpg --quick-generate-key --yes --batch --passphrase '' \
-          user@rancher-desktop.test default \
-          default never
-
-        # Get info about the newly created key
-        DATA="$(gpg --batch --with-colons --with-keygrip --list-secret-keys)"
-        FINGERPRINT="$(awk -F: '/^fpr:/ { print $10 ; exit }' <<< "${DATA}")" # spellcheck-ignore-line
-        GRIP="$(awk -F: '/^grp:/ { print $10 ; exit }' <<< "${DATA}")"
-
-        # Save the password
-        gpg-connect-agent --verbose "PRESET_PASSPHRASE ${GRIP} -1 00" /bye
-
-        # Initialize pass
-        pass init "${FINGERPRINT}"
+        Set-Content -Encoding UTF8NoBOM -Path "${HOME}/.wslconfig" -Value @"
+        ; Note that not all settings here make sense together.
+        [wsl]
+        dnsProxy=false
+        ; networkingMode=mirrored ; https://github.com/rancher-sandbox/rancher-desktop/issues/6665
+        firewall=true
+        dnsTunneling=true
+        autoProxy=true
+        [experimental]
+        autoMemoryReclaim=gradual
+        sparseVhd=true
+        useWindowsDnsCache=true
+        bestEffortDnsParsing=true
+        hostAddressLoopback=true
+        "@
 
     - name: Set log directory
       shell: bash
@@ -230,20 +255,24 @@ jobs:
         --report-formatter tap
         'tests/${{ steps.normalize.outputs.test }}'
       env:
-        BATS_COMMAND:            ${{ env.BATS_COMMAND }}
-        GITHUB_TOKEN:            ${{ github.token }}
-        LOGS_DIR:                ${{ env.LOGS_DIR }}
-        RD_CAPTURE_LOGS:         "true"
-        RD_CONTAINER_ENGINE:     ${{ matrix.engine }}
-        RD_TAKE_SCREENSHOTS:     "true"
-        RD_TRACE:                "true"
-        RD_USE_GHCR_IMAGES:      "true"
-        RD_USE_RAMDISK:          "true"
-        RD_USE_WINDOWS_EXE:      "${{ runner.os == 'Windows' }}"
+        BATS_COMMAND:              ${{ env.BATS_COMMAND }}
+        GITHUB_TOKEN:              ${{ github.token }}
+        LOGS_DIR:                  ${{ env.LOGS_DIR }}
+        RD_CAPTURE_LOGS:           "true"
+        RD_CONTAINER_ENGINE:       ${{ matrix.engine }}
+        RD_KUBERNETES_VERSION:     ${{ matrix.k3sVersion }}
+        RD_KUBERNETES_ALT_VERSION: ${{ matrix.k3sAltVersion }}
+        RD_TAKE_SCREENSHOTS:       "true"
+        RD_TRACE:                  "true"
+        RD_USE_GHCR_IMAGES:        "true"
+        RD_USE_RAMDISK:            "true"
+        RD_USE_WINDOWS_EXE:        "${{ runner.os == 'Windows' }}"
         WSLENV: "\
           GITHUB_TOKEN:\
           RD_CAPTURE_LOGS:\
           RD_CONTAINER_ENGINE:\
+          RD_KUBERNETES_VERSION:\
+          RD_KUBERNETES_ALT_VERSION:\
           RD_TAKE_SCREENSHOTS:\
           RD_TRACE:\
           RD_USE_GHCR_IMAGES:\
@@ -289,7 +318,7 @@ jobs:
 
     - name: Upload logs
       if: ${{ !cancelled() }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ steps.log_name.outputs.name }}
         path: logs/
@@ -297,22 +326,24 @@ jobs:
 
   summarize:
     name: Summarize output
-    needs: bats
+    needs: [ get-tests, bats ]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
     - name: Fetch summarizer script
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
         sparse-checkout-cone-mode: false
         sparse-checkout: |
           package.json
           .github/workflows/bats/summarize.mjs
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version-file: package.json
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         pattern: "*.logs"
     - run: node .github/workflows/bats/summarize.mjs
+      env:
+        EXPECTED_TESTS: ${{ needs.get-tests.outputs.tests }}

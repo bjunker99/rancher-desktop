@@ -103,18 +103,25 @@ export default class SettingsValidator {
         name: this.checkEnum('containerd', 'moby', 'docker'),
       },
       virtualMachine: {
-        memoryInGB:   this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
-        numberCPUs:   this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
-        hostResolver: this.checkPlatform('win32', this.checkBoolean),
+        memoryInGB: this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
+        numberCPUs: this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
+        useRosetta: this.checkPlatform('darwin', this.checkRosetta),
+        type:       this.checkPlatform('darwin', this.checkMulti(
+          this.checkEnum(...Object.values(VMType)),
+          this.checkVMType),
+        ),
+        mount: {
+          type: this.checkLima(this.checkMulti(
+            this.checkEnum(...Object.values(MountType)),
+            this.checkMountType),
+          ),
+        },
       },
       experimental: {
         containerEngine: { webAssembly: { enabled: this.checkBoolean } },
+        kubernetes:      { options: { spinkube: this.checkMulti(this.checkBoolean, this.checkSpinkube) } },
         virtualMachine:  {
           mount: {
-            type: this.checkLima(this.checkMulti(
-              this.checkEnum(...Object.values(MountType)),
-              this.checkMountType),
-            ),
             '9p': {
               securityModel:   this.checkLima(this.check9P(this.checkEnum(...Object.values(SecurityModel)))),
               protocolVersion: this.checkLima(this.check9P(this.checkEnum(...Object.values(ProtocolVersion)))),
@@ -122,13 +129,6 @@ export default class SettingsValidator {
               cacheMode:       this.checkLima(this.check9P(this.checkEnum(...Object.values(CacheMode)))),
             },
           },
-          socketVMNet:      this.checkPlatform('darwin', this.checkBoolean),
-          networkingTunnel: this.checkPlatform('win32', this.checkBoolean),
-          useRosetta:       this.checkPlatform('darwin', this.checkRosetta),
-          type:             this.checkPlatform('darwin', this.checkMulti(
-            this.checkEnum(...Object.values(VMType)),
-            this.checkVMType),
-          ),
           proxy: {
             enabled:  this.checkPlatform('win32', this.checkBoolean),
             address:  this.checkPlatform('win32', this.checkString),
@@ -137,6 +137,7 @@ export default class SettingsValidator {
             username: this.checkPlatform('win32', this.checkString),
             noproxy:  this.checkPlatform('win32', this.checkUniqueStringArray),
           },
+          sshPortForwarder: this.checkLima(this.checkBoolean),
         },
       },
       WSL:        { integrations: this.checkPlatform('win32', this.checkBooleanMapping) },
@@ -298,8 +299,8 @@ export default class SettingsValidator {
 
   protected checkRosetta(mergedSettings: Settings, currentValue: boolean, desiredValue: boolean, errors: string[], fqname: string): boolean {
     if (desiredValue && !currentValue) {
-      if (mergedSettings.experimental.virtualMachine.type !== VMType.VZ) {
-        errors.push(`Setting ${ fqname } can only be enabled when experimental.virtual-machine.type is "${ VMType.VZ }".`);
+      if (mergedSettings.virtualMachine.type !== VMType.VZ) {
+        errors.push(`Setting ${ fqname } can only be enabled when virtual-machine.type is "${ VMType.VZ }".`);
         this.isFatal = true;
 
         return false;
@@ -328,18 +329,18 @@ export default class SettingsValidator {
 
         return false;
       }
-      if (mergedSettings.experimental.virtualMachine.mount.type === MountType.NINEP) {
+      if (mergedSettings.virtualMachine.mount.type === MountType.NINEP) {
         errors.push(
-          `Setting ${ fqname } to "${ VMType.VZ }" requires that experimental.virtual-machine.mount.type is ` +
+          `Setting ${ fqname } to "${ VMType.VZ }" requires that virtual-machine.mount.type is ` +
           `"${ MountType.REVERSE_SSHFS }" or "${ MountType.VIRTIOFS }".`);
 
         return false;
       }
     }
     if (desiredValue === VMType.QEMU) {
-      if (mergedSettings.experimental.virtualMachine.mount.type === MountType.VIRTIOFS && os.platform() === 'darwin') {
+      if (mergedSettings.virtualMachine.mount.type === MountType.VIRTIOFS && os.platform() === 'darwin') {
         errors.push(
-          `Setting ${ fqname } to "${ VMType.QEMU }" requires that experimental.virtual-machine.mount.type is ` +
+          `Setting ${ fqname } to "${ VMType.QEMU }" requires that virtual-machine.mount.type is ` +
           `"${ MountType.REVERSE_SSHFS }" or "${ MountType.NINEP }".`);
 
         return false;
@@ -350,23 +351,36 @@ export default class SettingsValidator {
   }
 
   protected checkMountType(mergedSettings: Settings, currentValue: string, desiredValue: string, errors: string[], fqname: string): boolean {
-    if (desiredValue === MountType.VIRTIOFS && mergedSettings.experimental.virtualMachine.type !== VMType.VZ && os.platform() === 'darwin') {
-      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that experimental.virtual-machine.type is "${ VMType.VZ }".`);
+    if (desiredValue === MountType.VIRTIOFS && mergedSettings.virtualMachine.type !== VMType.VZ && os.platform() === 'darwin') {
+      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that virtual-machine.type is "${ VMType.VZ }".`);
       this.isFatal = true;
 
       return false;
     }
-    if (desiredValue === MountType.VIRTIOFS && mergedSettings.experimental.virtualMachine.type !== VMType.QEMU && os.platform() === 'linux') {
-      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that experimental.virtual-machine.type is "${ VMType.QEMU }".`);
+    if (desiredValue === MountType.VIRTIOFS && mergedSettings.virtualMachine.type !== VMType.QEMU && os.platform() === 'linux') {
+      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that virtual-machine.type is "${ VMType.QEMU }".`);
       this.isFatal = true;
 
       return false;
     }
-    if (desiredValue === MountType.NINEP && mergedSettings.experimental.virtualMachine.type !== VMType.QEMU) {
-      errors.push(`Setting ${ fqname } to "${ MountType.NINEP }" requires that experimental.virtual-machine.type is "${ VMType.QEMU }".`);
+    if (desiredValue === MountType.NINEP && mergedSettings.virtualMachine.type !== VMType.QEMU) {
+      errors.push(`Setting ${ fqname } to "${ MountType.NINEP }" requires that virtual-machine.type is "${ VMType.QEMU }".`);
       this.isFatal = true;
 
       return false;
+    }
+
+    return currentValue !== desiredValue;
+  }
+
+  protected checkSpinkube(mergedSettings: Settings, currentValue: boolean, desiredValue: boolean, errors: string[], fqname: string): boolean {
+    if (mergedSettings.kubernetes.enabled && desiredValue) {
+      if (!mergedSettings.experimental.containerEngine.webAssembly.enabled) {
+        errors.push(`Setting ${ fqname } can only be set when experimental.container-engine.web-assembly.enabled is set as well.`);
+        this.isFatal = true;
+
+        return false;
+      }
     }
 
     return currentValue !== desiredValue;
@@ -389,9 +403,9 @@ export default class SettingsValidator {
 
   protected check9P<C, D>(validator: ValidatorFunc<Settings, C, D>) {
     return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: string) => {
-      if (mergedSettings.experimental.virtualMachine.mount.type !== MountType.NINEP) {
+      if (mergedSettings.virtualMachine.mount.type !== MountType.NINEP) {
         if (!_.isEqual(currentValue, desiredValue)) {
-          errors.push(`Setting ${ fqname } can only be changed when experimental.virtualMachine.mount.type is "${ MountType.NINEP }".`);
+          errors.push(`Setting ${ fqname } can only be changed when virtualMachine.mount.type is "${ MountType.NINEP }".`);
           this.isFatal = true;
         }
 

@@ -50,12 +50,10 @@ interface execProcess {
   [stream]: v1.ExecStreamOptions;
 }
 
-// eslint-disable-next-line import/namespace -- it doesn't understand TypeScript
 interface RDXExecOptions extends v1.ExecOptions {
   namespace?: string;
 }
 
-// eslint-disable-next-line import/namespace -- it doesn't understand TypeScript
 interface RDXSpawnOptions extends v1.SpawnOptions {
   namespace?: string;
 }
@@ -200,7 +198,7 @@ function getExec(scope: SpawnOptions['scope']): v1.Exec {
 
       console.debug(`spawn/blocking got result:`, process.env.RD_TEST === 'e2e' ? JSON.stringify(response) : response);
 
-      return {
+      const result = {
         cmd:    response.cmd,
         signal: typeof response.result === 'string' ? response.result : undefined,
         code:   typeof response.result === 'number' ? response.result : undefined,
@@ -216,6 +214,12 @@ function getExec(scope: SpawnOptions['scope']): v1.Exec {
           return JSON.parse(response.stdout);
         },
       };
+
+      if (result.signal || result.code) {
+        throw result;
+      }
+
+      return result;
     })();
   }
 
@@ -298,7 +302,7 @@ ipcRenderer.on('extensions/spawn/close', (_, id, returnValue) => {
 });
 
 // During the nuxt removal, import/namespace started failing
-// eslint-disable-next-line import/namespace
+
 class Client implements v1.DockerDesktopClient {
   constructor(info: {arch: string, hostname: string}) {
     Object.assign(this.host, info);
@@ -309,8 +313,16 @@ class Client implements v1.DockerDesktopClient {
    * that wraps ddClient.extension.vm.service.request().
    */
   protected makeRequest(method: string, url: string, data?: any): Promise<unknown> {
+    const headers: Record<string, string> = {};
+
+    if (typeof data === 'object') {
+      // For objects, pass the value as JSON.
+      headers['Content-Type'] = 'application/json';
+      data = JSON.stringify(data);
+    }
+
     return this.request({
-      method, url, data, headers: {},
+      method, url, data, headers,
     });
   }
 
@@ -318,12 +330,26 @@ class Client implements v1.DockerDesktopClient {
     try {
       const result = await ipcRenderer.invoke('extensions/vm/http-fetch', config);
 
-      // Parse as JSON if possible (API is unclear).
-      try {
-        return JSON.parse(result);
-      } catch {
-        return result;
+      if (!result) {
+        return;
       }
+
+      // Parse as JSON if possible (API is unclear).
+      let { statusCode, message } = result;
+
+      try {
+        if (message) {
+          message = JSON.parse(message);
+        }
+      } catch {
+        // Body is not JSON, return it as-is.
+      }
+
+      if (statusCode >= 200 && statusCode < 300) {
+        return message;
+      }
+
+      return Promise.reject(result);
     } catch (ex) {
       console.debug(`${ config.method } ${ config.url } error:`, ex);
       throw ex;
@@ -441,7 +467,7 @@ class Client implements v1.DockerDesktopClient {
           for (const p of prop) {
             const [key, newKey] = Array.isArray(p) ? p : [p, p];
 
-            if (key in object ?? {}) {
+            if (key in (object ?? {})) {
               result[newKey] = object[key];
             }
           }

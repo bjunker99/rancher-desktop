@@ -11,10 +11,11 @@ import (
 	"runtime"
 	"syscall"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/runner"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/runner"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
 )
 
 var snapshotDescription string
@@ -42,13 +43,13 @@ var snapshotCreateCmd = &cobra.Command{
 			}
 			snapshotDescription = string(bytes)
 		}
-		return exitWithJsonOrErrorCondition(createSnapshot(args))
+		return exitWithJSONOrErrorCondition(createSnapshot(args))
 	},
 }
 
 func init() {
 	snapshotCmd.AddCommand(snapshotCreateCmd)
-	snapshotCreateCmd.Flags().BoolVar(&outputJsonFormat, "json", false, "output json format")
+	snapshotCreateCmd.Flags().BoolVar(&outputJSONFormat, "json", false, "output json format")
 	snapshotCreateCmd.Flags().StringVar(&snapshotDescription, "description", "", "snapshot description")
 	snapshotCreateCmd.Flags().StringVar(&snapshotDescriptionFrom, "description-from", "", "snapshot description from a file (or - for stdin)")
 }
@@ -70,7 +71,7 @@ func createSnapshot(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM)
 	defer stop()
 	stopAfterFunc := context.AfterFunc(ctx, func() {
-		if !outputJsonFormat {
+		if !outputJSONFormat {
 			fmt.Println("Cancelling snapshot creation...")
 		}
 	})
@@ -84,11 +85,12 @@ func createSnapshot(args []string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
-	execCmd := exec.Command("tmutil", "addexclusion", manager.Paths.Snapshots)
+	//nolint:gosec // manager.Snapshots is not a user input
+	execCmd := exec.Command("tmutil", "addexclusion", manager.Snapshots)
 	output, err := execCmd.CombinedOutput()
 	if err != nil {
 		msg := fmt.Errorf("`tmutil addexclusion` failed to add exclusion to TimeMachine: %w: %s", err, output)
-		if outputJsonFormat {
+		if outputJSONFormat {
 			return msg
 		} else {
 			logrus.Errorln(msg)

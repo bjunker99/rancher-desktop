@@ -6,14 +6,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/lock"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/lock"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 )
 
-func populateFiles(t *testing.T, includeOverrideYaml bool) (paths.Paths, map[string]TestFile) {
+func populateFiles(t *testing.T, includeOverrideYaml bool) (*paths.Paths, map[string]TestFile) {
 	baseDir := t.TempDir()
 	appPaths := paths.Paths{
 		AppHome:   baseDir,
@@ -62,10 +63,10 @@ func populateFiles(t *testing.T, includeOverrideYaml bool) (paths.Paths, map[str
 			t.Fatalf("failed to create test file %q: %s", file.Path, err)
 		}
 	}
-	return appPaths, testFiles
+	return &appPaths, testFiles
 }
 
-func newTestManager(appPaths paths.Paths) *Manager {
+func newTestManager(appPaths *paths.Paths) *Manager {
 	manager := &Manager{
 		Paths:         appPaths,
 		Snapshotter:   NewSnapshotterImpl(),

@@ -13,15 +13,12 @@ export class VirtualMachineNav {
   readonly msizeInKib: Locator;
   readonly protocolVersion: Locator;
   readonly securityModel: Locator;
-  readonly networkingTunnel: Locator;
   readonly vmType: Locator;
   readonly qemu: Locator;
   readonly vz: Locator;
   readonly useRosetta: Locator;
-  readonly socketVmNet: Locator;
   readonly tabHardware: Locator;
   readonly tabVolumes: Locator;
-  readonly tabNetwork: Locator;
   readonly tabEmulation: Locator;
 
   constructor(page: Page) {
@@ -37,15 +34,12 @@ export class VirtualMachineNav {
     this.msizeInKib = page.locator('[data-test="msizeInKib"]');
     this.protocolVersion = page.locator('[data-test="protocolVersion"]');
     this.securityModel = page.locator('[data-test="securityModel"]');
-    this.networkingTunnel = page.locator('[data-test="networkingTunnel"]');
     this.vmType = page.locator('[data-test="vmType"]');
     this.qemu = page.locator('[data-test="QEMU"]');
     this.vz = page.locator('[data-test="VZ"]');
     this.useRosetta = page.locator('[data-test="useRosetta"]');
-    this.socketVmNet = page.locator('[data-test="socketVmNet"]');
     this.tabHardware = page.locator('.tab >> text=Hardware');
     this.tabVolumes = page.locator('.tab >> text=Volumes');
-    this.tabNetwork = page.locator('.tab >> text=Network');
     this.tabEmulation = page.locator('.tab >> text=Emulation');
   }
 }

@@ -40,120 +40,94 @@ jobs:
         include:
         - platform: mac
           arch: x86_64
-          runs-on: macos-11
+          runs-on: macos-13
         - platform: mac
           arch: aarch64
-          runs-on: macos-11
+          runs-on: macos-latest
         - platform: win
-          runs-on: windows-2019
+          runs-on: windows-latest
         - platform: linux
-          runs-on: ubuntu-20.04
+          runs-on: ubuntu-22.04
     runs-on: ${{ matrix.runs-on }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
         # Needed to run `git describe` to get full version info
         fetch-depth: 0
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '18.16.x'
-        cache: yarn
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '^1.21'
-        cache-dependency-path: src/go/**/go.sum
-    - name: Install Windows dependencies
-      if: runner.os == 'Windows'
-      shell: powershell
-      run: .\scripts\windows-setup.ps1 -SkipVisualStudio -SkipTools
-    - name: Flag build for M1
-      if: matrix.arch == 'aarch64' && matrix.platform == 'mac'
-      run: echo "M1=1" >> "${GITHUB_ENV}"
-    - run: pip install setuptools
-    - # Needs a network timeout for macos & windows. See https://github.com/yarnpkg/yarn/issues/8242 for more info
-      run: yarn install --frozen-lockfile --network-timeout 1000000
+    - uses: ./.github/actions/yarn-install
     - run: yarn build
     - run: yarn package
     - name: Build bats.tar.gz
       if: matrix.platform == 'linux'
       run: make -C bats bats.tar.gz
     - name: Upload bats.tar.gz
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'linux'
       with:
         name: bats.tar.gz
         path: bats/bats.tar.gz
         if-no-files-found: error
     - name: Upload mac disk image
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'mac'
       with:
         name: Rancher Desktop.${{ matrix.arch }}.dmg
         path: dist/Rancher Desktop*.dmg
         if-no-files-found: error
     - name: Upload mac zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'mac'
       with:
         name: Rancher Desktop-mac.${{ matrix.arch }}.zip
         path: dist/Rancher Desktop*.zip
         if-no-files-found: error
     - name: Upload Windows installer
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'win'
       with:
         name: Rancher Desktop Setup.msi
-        path: dist/Rancher Desktop*.msi
+        path: dist/Rancher.Desktop*.msi
         if-no-files-found: error
     - name: Upload Windows zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'win'
       with:
         name: Rancher Desktop-win.zip
         path: dist/Rancher Desktop-*-win.zip
         if-no-files-found: error
     - name: Upload Linux zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: matrix.platform == 'linux'
       with:
         name: Rancher Desktop-linux.zip
         path: dist/rancher-desktop-*-linux.zip
         if-no-files-found: error
-    - id: has_s3
-      name: Check if S3 secrets are available
-      continue-on-error: true
-      if: github.ref_type == 'branch' && ( startsWith(github.ref_name, 'main') || startsWith(github.ref_name, 'release-') )
-      run: '[[ -n "${key}" ]]'
-      env:
-        key: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    - name: set zip_name env var
-      id: zip_name
-      if: matrix.platform == 'linux' && steps.has_s3.outcome == 'success'
+    - name: Trigger OBS build
+      if: matrix.platform == 'linux' && github.ref_type == 'branch' && ( startsWith(github.ref_name, 'main') || startsWith(github.ref_name, 'release-') )
       run: |
+        if [[ -z $AWS_ACCESS_KEY_ID ]] || [[ -z $OBS_WEBHOOK_TOKEN ]]; then
+          echo "Secrets unavailable, skipping."
+          exit 0
+        fi
         # in pull requests GITHUB_REF_NAME is in the form "<pr_number>/merge";
         # remove slashes since they aren't valid in filenames
-        no_slash_ref_name="${GITHUB_REF_NAME//\//-/}"
+        no_slash_ref_name="${GITHUB_REF_NAME//\//-}"
         zip_name="rancher-desktop-linux-${no_slash_ref_name}.zip"
-        echo "zip_name=${zip_name}" >> "${GITHUB_OUTPUT}"
-    - name: Copy zip file to S3
-      uses: prewk/s3-cp-action@74701625561055a306f92fa5c18e948f9d14a54a
-      if: matrix.platform == 'linux' && steps.has_s3.outcome == 'success'
-      with:
-        aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        source: dist/rancher-desktop-*-linux.zip
-        dest: s3://rancher-desktop-assets-for-obs/${{ steps.zip_name.outputs.zip_name }}
-    - name: Trigger OBS services for relevant package in dev channel
-      if: matrix.platform == 'linux' && steps.has_s3.outcome == 'success'
-      run: |
+
+        # Copy zip file to S3
+        aws s3 cp \
+          dist/rancher-desktop-*-linux.zip \
+          "s3://rancher-desktop-assets-for-obs/$zip_name"
+
+        # Trigger OBS services for relevant package in dev channel
         curl -X POST \
           -H "Authorization: Token ${OBS_WEBHOOK_TOKEN}" \
           "https://build.opensuse.org/trigger/runservice?project=isv:Rancher:dev&package=rancher-desktop-${GITHUB_REF_NAME}"
       env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
         OBS_WEBHOOK_TOKEN: ${{ secrets.OBS_WEBHOOK_TOKEN }}
 
   sign-win:
@@ -168,23 +142,11 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
-    - name: Install Windows dependencies
-      shell: powershell
-      run: .\scripts\windows-setup.ps1 -SkipVisualStudio -SkipTools
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '^1.21'
-        cache-dependency-path: src/go/**/go.sum
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '18.16.x'
-        cache: yarn
-      # Needs a network timeout for macos & windows. See https://github.com/yarnpkg/yarn/issues/8242 for more info
-    - run: yarn install --frozen-lockfile --network-timeout 1000000
-    - uses: actions/download-artifact@v4
+    - uses: ./.github/actions/yarn-install
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       name: Download artifact
       with:
         name: Rancher Desktop-win.zip
@@ -209,7 +171,7 @@ jobs:
     - name: Verify installer signature
       shell: powershell
       run: |
-        $usedCert = (Get-AuthenticodeSignature -FilePath 'dist\Rancher Desktop Setup*.msi').SignerCertificate
+        $usedCert = (Get-AuthenticodeSignature -FilePath 'dist\Rancher*Desktop*.msi').SignerCertificate
         Write-Output $usedCert
         if ($usedCert.Thumbprint -ne $env:CSC_FINGERPRINT) {
           Throw "Installer signed with wrong certificate"
@@ -224,7 +186,7 @@ jobs:
         include:
         - arch: aarch64
         # skip x86_64, we don't need to duplicate the testing for now.
-    runs-on: macos-12
+    runs-on: macos-latest
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')) ||
@@ -233,20 +195,11 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '^1.21'
-        cache-dependency-path: src/go/**/go.sum
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '18.16.x'
-        cache: yarn
-      # Needs a network timeout for macos & windows. See https://github.com/yarnpkg/yarn/issues/8242 for more info
-    - run: yarn install --frozen-lockfile --network-timeout 1000000
-    - uses: actions/download-artifact@v4
+    - uses: ./.github/actions/yarn-install
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       name: Download artifact
       with:
         name: Rancher Desktop-mac.${{ matrix.arch }}.zip

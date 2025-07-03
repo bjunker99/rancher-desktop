@@ -49,8 +49,10 @@ docker() {
     docker_exe --context $RD_DOCKER_CONTEXT "$@"
 }
 docker_exe() {
-    # Add path to bundled credential helpers to the front of the PATH
-    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" "$PATH_RESOURCES/$PLATFORM/bin/docker$EXE" "$@" | no_cr
+    # Add path to bundled credential helpers to the front of the PATH; also
+    # ensure that on Windows, it gets exported.
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" WSLENV="PATH/l:${WSLENV:-}" \
+        "$PATH_RESOURCES/$PLATFORM/bin/docker$EXE" "$@" | no_cr
 }
 helm() {
     "$PATH_RESOURCES/$PLATFORM/bin/helm$EXE" "$@" | no_cr
@@ -66,13 +68,18 @@ limactl() {
     LIMA_HOME="$LIMA_HOME" "$PATH_RESOURCES/$PLATFORM/lima/bin/limactl" "$@"
 }
 nerdctl() {
-    "$PATH_RESOURCES/$PLATFORM/bin/nerdctl$EXE" --namespace "$CONTAINERD_NAMESPACE" "$@" | no_cr
+    # Add path to bundled credential helpers to the front of the PATH; also
+    # ensure that on Windows, it gets exported.
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" WSLENV="PATH/l:${WSLENV:-}" \
+        "$PATH_RESOURCES/$PLATFORM/bin/nerdctl$EXE" --namespace "$CONTAINERD_NAMESPACE" "$@" | no_cr
 }
+# Run `rdctl`; if $RD_TIMEOUT is set, the value is used as the first argument to
+# the `timeout` command.
 rdctl() {
     if is_windows; then
-        "$PATH_RESOURCES/win32/bin/rdctl.exe" "$@" | no_cr
+        timeout "${RD_TIMEOUT:-0}" "$PATH_RESOURCES/win32/bin/rdctl.exe" "$@" | no_cr
     else
-        "$PATH_RESOURCES/$PLATFORM/bin/rdctl$EXE" "$@"
+        timeout "${RD_TIMEOUT:-0}" "$PATH_RESOURCES/$PLATFORM/bin/rdctl$EXE" "$@"
     fi
 }
 rdshell() {
@@ -80,6 +87,10 @@ rdshell() {
 }
 rdsudo() {
     rdshell sudo "$@"
+}
+spin() {
+    # spin may call itself recursively, so make sure it calls the correct binary
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" "$PATH_RESOURCES/$PLATFORM/bin/spin$EXE" "$@" | no_cr
 }
 wsl() {
     wsl.exe -d "$WSL_DISTRO" "$@"

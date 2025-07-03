@@ -6,8 +6,8 @@
         :key="item.route"
         :item="item.route"
       >
-        <NuxtLink
-          :class="{'nuxt-link-active': isRouteActive(item.route) }"
+        <RouterLink
+          :class="{'rd-link-active': isRouteActive(item.route) }"
           :to="item.route"
         >
           {{ routes[item.route].name }}
@@ -25,28 +25,26 @@
             }"
             :class="`icon icon-flask`"
           />
-        </NuxtLink>
+        </RouterLink>
       </li>
     </ul>
-    <template v-if="featureExtensions">
-      <hr v-if="extensionsWithUI.length">
-      <div class="nav-extensions">
-        <template v-for="extension in extensionsWithUI">
-          <nuxt-link
-            :key="extension.id"
-            :data-test="`extension-nav-${ extension.metadata.ui['dashboard-tab'].title.toLowerCase() }`"
-            :to="extensionRoute(extension)"
-          >
-            <nav-item :id="`extension:${extension.id}`">
-              <template #before>
-                <nav-icon-extension :extension-id="extension.id" />
-              </template>
-              {{ extension.metadata.ui['dashboard-tab'].title }}
-            </nav-item>
-          </nuxt-link>
-        </template>
-      </div>
-    </template>
+    <hr v-if="extensionsWithUI.length">
+    <div class="nav-extensions">
+      <template v-for="extension in extensionsWithUI">
+        <RouterLink
+          :key="extension.id"
+          :data-test="`extension-nav-${ extension.metadata.ui['dashboard-tab'].title.toLowerCase() }`"
+          :to="extensionRoute(extension)"
+        >
+          <nav-item :id="`extension:${extension.id}`">
+            <template #before>
+              <nav-icon-extension :extension-id="extension.id" />
+            </template>
+            {{ extension.metadata.ui['dashboard-tab'].title }}
+          </nav-item>
+        </RouterLink>
+      </template>
+    </div>
     <div class="nav-button-container">
       <dashboard-button
         data-testid="dashboard-button"
@@ -65,7 +63,6 @@
 <script lang="ts">
 import os from 'os';
 
-import { NuxtApp } from '@nuxt/types/app';
 import { BadgeState } from '@rancher/components';
 import Vue, { PropType } from 'vue';
 import { RouteRecordPublic } from 'vue-router';
@@ -75,11 +72,12 @@ import NavItem from './NavItem.vue';
 
 import DashboardButton from '@pkg/components/DashboardOpen.vue';
 import PreferencesButton from '@pkg/components/Preferences/ButtonOpen.vue';
-import type { ExtensionMetadata } from '@pkg/main/extensions/types';
+import router from '@pkg/entry/router';
+import type { ExtensionState } from '@pkg/store/extensions';
 import { hexEncode } from '@pkg/utils/string-encode';
 
-type ExtensionWithUI = ExtensionMetadata & {
-  ui: { 'dashboard-tab': { title: string } };
+type ExtensionWithUI = ExtensionState & {
+  metadata: { ui: { 'dashboard-tab': { title: string } } };
 };
 
 export default Vue.extend({
@@ -92,11 +90,10 @@ export default Vue.extend({
   },
   props: {
     items: {
-      type:      Array,
+      type:      Array as PropType<{route: string; error?: number; experimental?: boolean}[]>,
       required:  true,
       validator: (value: {route: string, error?: number}[]) => {
-        const nuxt: NuxtApp = (global as any).$nuxt;
-        const routes = nuxt.$router.getRoutes().reduce((paths: Record<string, RouteRecordPublic>, route) => {
+        const routes = router.getRoutes().reduce((paths: Record<string, RouteRecordPublic>, route) => {
           paths[route.path] = route;
 
           return paths;
@@ -114,17 +111,15 @@ export default Vue.extend({
       },
     },
     extensions: {
-      type:     Array as PropType<{ id: string, metadata: ExtensionMetadata }[]>,
+      type:     Array as PropType<ExtensionState[]>,
       required: true,
     },
   },
   data() {
-    const nuxt: NuxtApp = (this as any).$nuxt;
-
     return {
       // Generate a route (path) to route entry mapping, so that we can pick out
       // their names based on the paths given.
-      routes: nuxt.$router.getRoutes().reduce((paths: Record<string, RouteRecordPublic>, route) => {
+      routes: this.$router.getRoutes().reduce((paths: Record<string, RouteRecordPublic>, route) => {
         paths[route.path] = route;
         if (route.name === 'Supporting Utilities' && os.platform() === 'win32') {
           route.name = 'WSL Integrations';
@@ -135,15 +130,12 @@ export default Vue.extend({
     };
   },
   computed: {
-    featureExtensions(): boolean {
-      const nuxt: NuxtApp = (this as any).$nuxt;
+    extensionsWithUI(): ExtensionWithUI[] {
+      function hasUI(ext: ExtensionState): ext is ExtensionWithUI {
+        return !!ext.metadata.ui?.['dashboard-tab']?.title;
+      }
 
-      return !!nuxt.$config.featureExtensions;
-    },
-    extensionsWithUI(): { id: string, metadata: ExtensionWithUI }[] {
-      const allExtensions: { id: string, metadata: ExtensionMetadata }[] = (this as any).extensions;
-
-      return allExtensions.filter(ext => ext.metadata?.ui?.['dashboard-tab']) as any;
+      return this.extensions.filter<ExtensionWithUI>(hasUI);
     },
   },
   methods: {
@@ -161,15 +153,13 @@ export default Vue.extend({
     },
     isRouteActive(route: string): boolean {
       // It is needed e.g. for sub-route /images/add not matching /Images
-      const nuxt: NuxtApp = (this as any).$nuxt;
-
       // Prevents the parent item "Extensions" to be shown as active if an extension child (e.g. Epinio, Logs Explorer,
       // ...) is selected.
-      if (nuxt.$route.name !== 'rdx-root-src-id') {
-        return nuxt.$route.path.split('/')[1] === route.substring(1).toLowerCase();
+      if (this.$route.name === 'rdx-root-src-id') {
+        return false;
       }
 
-      return false;
+      return this.$route.path.toLowerCase().startsWith(route.toLowerCase());
     },
     openPreferences(): void {
       this.$emit('open-preferences');
@@ -221,7 +211,7 @@ ul {
             outline: none;
         }
 
-        a.nuxt-link-active {
+        a:is(.router-link-active, .rd-link-active) {
             background-color: var(--nav-active);
         }
     }
@@ -232,7 +222,7 @@ a {
     text-decoration: none;
   }
 
-  &.nuxt-link-active::v-deep div {
+  &:is(.router-link-active, .rd-link-active)::v-deep div {
     background-color: var(--nav-active);
   }
 }

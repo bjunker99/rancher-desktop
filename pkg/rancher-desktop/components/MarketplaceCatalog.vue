@@ -2,17 +2,11 @@
 import Vue, { VueConstructor } from 'vue';
 import { mapGetters } from 'vuex';
 
-import { demoMarketplace } from '../utils/_demo_marketplace_items.js';
-
 import MarketplaceCard from '@pkg/components/MarketplaceCard.vue';
 import { Settings, ContainerEngine } from '@pkg/config/settings';
-import { ExtensionState } from '@pkg/store/extensions.js';
+import type { ExtensionState, MarketplaceData } from '@pkg/store/extensions';
 
-type FilteredExtensions = typeof demoMarketplace.summaries;
-
-interface installedExtensions extends ExtensionState {
-  id: string
-}
+type ExtensionData = MarketplaceData;
 
 interface VuexBindings {
   getPreferences: Settings;
@@ -22,31 +16,14 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   name:       'marketplace-catalog',
   components: { MarketplaceCard },
   data() {
-    return {
-      searchValue: '',
-      loading:     true,
-      credentials: {
-        user:     '',
-        password: '',
-        port:     0,
-      },
-      extensions:          demoMarketplace.summaries,
-      installedExtensions: [] as installedExtensions[],
-    };
-  },
-  async fetch() {
-    this.credentials = await this.$store.dispatch(
-      'credentials/fetchCredentials',
-    );
-
-    if (!this.credentials) {
-      return;
-    }
-
-    this.loading = false;
+    return { searchValue: '' };
   },
   computed: {
     ...mapGetters('preferences', ['getPreferences']),
+    ...mapGetters('extensions', ['installedExtensions', 'marketData']) as {
+      installedExtensions: () => ExtensionState[],
+      marketData: () => MarketplaceData[],
+    },
     containerEngine(): string {
       return this.getPreferences.containerEngine.name;
     },
@@ -59,28 +36,15 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
     allowedExtensions(): string[] {
       return this.getPreferences.application.extensions.allowed.list;
     },
-    filteredExtensions(): FilteredExtensions {
-      let tempExtensions = this.extensions
+    filteredExtensions(): ExtensionData[] {
+      let tempExtensions = this.marketData
         .filter((item) => {
           return this.isAllowed(item.slug);
-        })
-        .map((item) => {
-          if (this.isInstalled(item.slug)) {
-            return {
-              ...item,
-              installed: true,
-            };
-          }
-
-          return {
-            ...item,
-            installed: false,
-          };
         });
 
       if (this.searchValue) {
         tempExtensions = tempExtensions.filter((item) => {
-          return item.name
+          return item.title
             .toLowerCase()
             .includes(this.searchValue.toLowerCase());
         });
@@ -89,18 +53,19 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       const collator = new Intl.Collator('en', { sensitivity: 'base' });
 
       return filteredExtensions.sort((s1, s2) => {
-        return collator.compare(s1.name, s2.name);
+        return collator.compare(s1.title, s2.title);
       });
     },
   },
   methods: {
-    isInstalled(slug: string) {
-      this.installedExtensions = this.$store.getters['extensions/list'];
-
-      return this.installedExtensions.find(item => item?.id === slug);
+    installedVersion(slug: string) {
+      return this.installedExtensions.find(item => item.id === slug)?.version;
     },
     isAllowed(slug: string) {
       return !this.allowedListEnabled || this.allowedExtensions.includes(slug);
+    },
+    installedExtension(slug: string) {
+      return this.installedExtensions.find(item => item.id === slug);
     },
   },
 });
@@ -120,7 +85,6 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       {{ t('marketplace.noResults') }}
     </div>
     <div
-      v-if="!loading"
       class="extensions-content"
     >
       <div
@@ -130,10 +94,8 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       >
         <MarketplaceCard
           :extension="item"
-          :data-test="`extension-card-${item.name.toLowerCase()}`"
-          :is-installed="item.installed"
-          :credentials="credentials"
-          @update:extension="isInstalled"
+          :installed="installedExtension(item.slug)"
+          :data-test="`extension-card-${item.title.toLowerCase()}`"
         />
       </div>
     </div>

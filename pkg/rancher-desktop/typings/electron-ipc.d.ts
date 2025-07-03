@@ -43,7 +43,7 @@ export interface IpcMainEvents {
   'confirm-do-image-deletion': (imageName: string, imageID: string) => void;
   'do-image-build': (taggedImageName: string) => void;
   'do-image-pull': (imageName: string) => void;
-  'do-image-scan': (imageName: string) => void;
+  'do-image-scan': (imageName: string, namespace: string) => void;
   'do-image-push': (imageName: string, imageID: string, tag: string) => void;
   'do-image-deletion': (imageName: string, imageID: string) => void;
   'do-image-deletion-batch': (images: string[]) => void;
@@ -135,8 +135,8 @@ export interface IpcMainInvokeEvents {
   /** Execute the given command and return the results. */
   'extensions/spawn/blocking': (options: import('@pkg/main/extensions/types').SpawnOptions) => import('@pkg/main/extensions/types').SpawnResult;
   'extensions/ui/show-open': (options: import('electron').OpenDialogOptions) => import('electron').OpenDialogReturnValue;
-  /** Fetch data from the backend, or arbitrary host ignoring CORS. */
-  'extensions/vm/http-fetch': (config: import('@docker/extension-api-client-types').v1.RequestConfig) => any;
+  /* Fetch data from the backend, or arbitrary host ignoring CORS. */
+  'extensions/vm/http-fetch': (config: import('@docker/extension-api-client-types').v1.RequestConfig) => import('@docker/extension-api-client-types').v1.ServiceError;
   // #endregion
 
   // #region Versions
@@ -182,7 +182,7 @@ export interface IpcRendererEvents {
   ) => void;
   'k8s-current-port': (port: number) => void;
   'k8s-versions': (
-    versions: import('@pkg/backend/k8s').VersionEntry[],
+    versions: import('@pkg/utils/kubeVersions').VersionEntry[],
     cachedOnly: boolean
   ) => void;
   'k8s-integrations': (integrations: Record<string, boolean | string>) => void;
@@ -230,6 +230,7 @@ export interface IpcRendererEvents {
   // #region extensions
   // The list of installed extensions may have changed.
   'extensions/changed': () => void;
+  'extensions/getContentArea': () => void;
   'extensions/open': (id: string, path: string) => void;
   'err:extensions/open': () => void;
   'extensions/close': () => void;

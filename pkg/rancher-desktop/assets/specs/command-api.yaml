@@ -101,7 +101,7 @@ paths:
       summary: >-
         Return a list of the check IDs for the Diagnostics category,
         or 404 if there is no such `category`.
-        Specifying an exiting category with no checks
+        Specifying an existing category with no checks
         will return status code 200 and an empty array.
       parameters:
       - in: query
@@ -141,6 +141,10 @@ paths:
                       type: object
                       additionalProperties:
                         type: string
+        '503':
+          description: >-
+            The extension manager has not been loaded yet.  The client should
+            retry the request at some future point in time.
 
   /v1/extensions/install:
     post:
@@ -207,6 +211,53 @@ paths:
           description: The application is performing a factory reset.
         '400':
           description: An error occurred
+
+  /v1/port_forwarding:
+    post:
+      operationId: createPortForward
+      summary: Create a new port forwarding
+      requestBody:
+        description: JSON block consisting of the port forwarding details
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                namespace:
+                  type: string
+                service:
+                  type: string
+                k8sPort:
+                  type:
+                  - string
+                  - integer
+                hostPort:
+                  type: integer
+        required: true
+      responses:
+        '200':
+          description: The port forwarding was created or already exists; the response contains the listening host port.
+          content:
+            text/plain:
+              schema:
+                type: integer
+        '400':
+          description: The port forwarding could not be created.
+    delete:
+      operationId: deletePortForward
+      summary: Delete a port forwarding
+      parameters:
+      - in: query
+        name: namespace
+      - in: query
+        name: service
+      - in: query
+        name: k8sPort
+      responses:
+        '200':
+          description: The port forwarding was deleted or doesn't exist.
+        '400':
+          description: The port forwarding could not be deleted.
 
   /v1/propose_settings:
     put:
@@ -558,10 +609,21 @@ components:
               minimum: 1
               x-rd-platforms: [darwin, linux]
               x-rd-usage: reserved number of CPUs
-            hostResolver:
+            type:
+              type: string
+              enum: [qemu, vz]
+              x-rd-platforms: [darwin]
+            useRosetta:
               type: boolean
-              x-rd-platforms: [win32]
-              x-rd-usage: resolve DNS queries on the host and not inside the VM
+              x-rd-platforms: [darwin]
+            mount:
+              type: object
+              x-rd-platforms: [darwin, linux]
+              properties:
+                type:
+                  type: string
+                  enum: [reverse-sshfs, 9p, virtiofs]
+                  x-rd-usage: how directories are shared; 9p is experimental.
         kubernetes:
           type: object
           properties:
@@ -605,21 +667,22 @@ components:
                     enabled:
                       type: boolean
                       x-rd-usage: enable support for containerd-wasm shims
+            kubernetes:
+              type: object
+              properties:
+                options:
+                  type: object
+                  properties:
+                    spinkube:
+                      type: boolean
+                      x-rd-usage: install spin operator
             virtualMachine:
               type: object
               properties:
-                socketVMNet:
-                  type: boolean
-                  x-rd-platforms: [darwin]
-                  x-rd-usage: use socket-vmnet instead of vde-vmnet
                 mount:
                   type: object
                   x-rd-platforms: [darwin, linux]
                   properties:
-                    type:
-                      type: string
-                      enum: [reverse-sshfs, 9p, virtiofs]
-                      x-rd-usage: how directories are shared
                     9p:
                       type: object
                       properties:
@@ -636,17 +699,6 @@ components:
                         cacheMode:
                           type: string
                           enum: [none, loose, fscache, mmap]
-                networkingTunnel:
-                  type: boolean
-                  x-rd-platforms: [win32]
-                  x-rd-usage: tunnel networking so it originates from the host
-                type:
-                  type: string
-                  enum: [qemu, vz]
-                  x-rd-platforms: [darwin]
-                useRosetta:
-                  type: boolean
-                  x-rd-platforms: [darwin]
                 proxy:
                   type: object
                   x-rd-platforms: [win32]
@@ -671,6 +723,10 @@ components:
                       type: array
                       x-rd-usage: list of hostname to exclude from using the proxy
                       items: { type: string }
+                sshPortForwarder:
+                  type: boolean
+                  x-rd-platforms: [darwin, linux]
+                  x-rd-usage: use SSH for port forwarding instead of gRPC
         WSL:
           type: object
           x-rd-platforms: [win32]

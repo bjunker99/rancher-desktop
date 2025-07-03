@@ -6,6 +6,8 @@ import type { ContainerEngineClient } from '@pkg/backend/containerClient';
 import type { Settings } from '@pkg/config/settings';
 import type { RecursiveReadonly } from '@pkg/utils/typeUtils';
 
+type PlatformSpecific<T> = Record<'darwin' | 'windows' | 'linux', T>;
+
 export type ExtensionMetadata = {
   /** Icon for the extension, as a path in the image. */
   icon: string;
@@ -33,8 +35,29 @@ export type ExtensionMetadata = {
       socket: string;
     }
   };
-  /** Files to copy to the host. */
-  host?: { binaries: Record<'darwin' | 'windows' | 'linux', { path: string }[]>[] };
+  host?: {
+    /** Files to copy to the host. */
+    binaries: PlatformSpecific<{ path: string }[]>[],
+    /**
+     * Rancher Desktop extension: this will be run after the extension is
+     * installed (possibly as an upgrade).  This file should be listed in
+     * `binaries`.  Errors will be ignored.
+     */
+    'x-rd-install'?: PlatformSpecific<string|string[]>,
+    /**
+     * Rancher Desktop extension: this will be run before the extension is
+     * uninstalled (possibly as an upgrade).  This file should be listed in
+     * `binaries`.  Errors will be ignored.
+     */
+    'x-rd-uninstall'?: PlatformSpecific<string|string[]>,
+    /**
+     * Rancher Desktop extension: this will be executed when the application
+     * quits.  The application may exit before the process completes.  It is not
+     * defined what the container engine / Kubernetes cluster may be doing at
+     * the time this is called.
+     */
+    'x-rd-shutdown'?: PlatformSpecific<string|string[]>,
+ };
 };
 
 /**

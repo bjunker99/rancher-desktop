@@ -1,10 +1,12 @@
 // This file contains exportable types and constants used for managing preferences
 // All the actual data and functions are in settingsImpl.ts
 
+import os from 'os';
+
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
-export const CURRENT_SETTINGS_VERSION = 11 as const;
+export const CURRENT_SETTINGS_VERSION = 16 as const;
 
 export enum VMType {
   QEMU = 'qemu',
@@ -86,13 +88,16 @@ export const defaultSettings = {
     name: ContainerEngine.MOBY,
   },
   virtualMachine: {
-    memoryInGB:   2,
-    numberCPUs:   2,
-    /**
-     * when set to true Dnsmasq is disabled and all DNS resolution
-     * is handled by host-resolver on Windows platform only.
-     */
-    hostResolver: true,
+    memoryInGB: 2,
+    numberCPUs: 2,
+    /** can only be set to VMType.VZ on macOS Ventura and later */
+    type:       process.platform === 'darwin' && parseInt(os.release(), 10) >= 23 ? VMType.VZ : VMType.QEMU,
+    /** can only be used when type is VMType.VZ, and only on aarch64 */
+    useRosetta: false,
+    mount:      {
+      // Mount type defaults to virtiofs when using VZ.
+      type: process.platform === 'darwin' && parseInt(os.release(), 10) >= 23 ? MountType.VIRTIOFS : MountType.REVERSE_SSHFS,
+    },
   },
   WSL:        { integrations: {} as Record<string, boolean> },
   kubernetes: {
@@ -117,19 +122,14 @@ export const defaultSettings = {
     mutedChecks: {} as Record<string, boolean>,
   },
   /**
-   * Experimental settings - there should not be any UI for these.
+   * Experimental settings
    */
   experimental: {
     containerEngine: { webAssembly: { enabled: false } },
+    /** can only be enabled if containerEngine.webAssembly.enabled is true */
+    kubernetes:      { options: { spinkube: false } },
     virtualMachine:  {
-      /** can only be set to VMType.VZ on macOS Ventura and later */
-      type:        VMType.QEMU,
-      /** can only be used when type is VMType.VZ, and only on aarch64 */
-      useRosetta:  false,
-      /** macOS only: if set, use socket_vmnet instead of vde_vmnet. */
-      socketVMNet: false,
-      mount:       {
-        type: MountType.REVERSE_SSHFS,
+      mount: {
         '9p': {
           securityModel:   SecurityModel.NONE,
           protocolVersion: ProtocolVersion.NINEP2000_L,
@@ -137,9 +137,7 @@ export const defaultSettings = {
           cacheMode:       CacheMode.MMAP,
         },
       },
-      /** windows only: if set, use gvisor based network rather than host-resolver/dnsmasq. */
-      networkingTunnel: false,
-      proxy:            {
+      proxy: {
         enabled:  false,
         address:  '',
         password: '',
@@ -148,6 +146,8 @@ export const defaultSettings = {
         noproxy:  ['0.0.0.0/8', '10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16',
           '224.0.0.0/4', '240.0.0.0/4'],
       },
+      /** Lima only: use SSH port forwarding instead of gRPC. */
+      sshPortForwarder: false,
     },
   },
 };

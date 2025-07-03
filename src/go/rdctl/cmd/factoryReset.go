@@ -19,10 +19,11 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/spf13/cobra"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/factoryreset"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/shutdown"
-	"github.com/spf13/cobra"
 )
 
 var removeKubernetesCache bool
@@ -43,7 +44,7 @@ Use the --remove-kubernetes-cache=BOOLEAN flag to also remove the cached Kuberne
 		}
 		cmd.SilenceUsage = true
 		commonShutdownSettings.WaitForShutdown = false
-		_, err := doShutdown(&commonShutdownSettings, shutdown.FactoryReset)
+		_, err := doShutdown(cmd.Context(), &commonShutdownSettings, shutdown.FactoryReset)
 		if err != nil {
 			return err
 		}
@@ -51,7 +52,7 @@ Use the --remove-kubernetes-cache=BOOLEAN flag to also remove the cached Kuberne
 		if err != nil {
 			return fmt.Errorf("failed to get paths: %w", err)
 		}
-		return factoryreset.DeleteData(paths, removeKubernetesCache)
+		return factoryreset.DeleteData(cmd.Context(), paths, removeKubernetesCache)
 	},
 }
 

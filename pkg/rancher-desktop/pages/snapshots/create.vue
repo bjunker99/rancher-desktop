@@ -6,7 +6,9 @@ import Vue from 'vue';
 import { mapGetters } from 'vuex';
 
 import { Snapshot, SnapshotEvent } from '@pkg/main/snapshots/types';
+import { currentTime } from '@pkg/utils/dateUtils';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { escapeHtml } from '@pkg/utils/string';
 
 const defaultName = () => {
   const dateString = dayjs().format('YYYY-MM-DD_HH_mm_ss');
@@ -69,6 +71,7 @@ export default Vue.extend({
           type:         'create',
           result:       'cancel',
           snapshotName: name,
+          eventTime:    currentTime(),
         });
       });
 
@@ -84,6 +87,7 @@ export default Vue.extend({
             type:         'create',
             result:       snapshotCancelled ? 'cancel' : 'success',
             snapshotName: name,
+            eventTime:    currentTime(),
           });
         }
       });
@@ -109,7 +113,7 @@ export default Vue.extend({
           format: {
             header:            this.t('snapshots.dialog.creating.header', { snapshot: name }),
             showProgressBar:   true,
-            message:           this.t('snapshots.dialog.creating.message', { snapshot: name }, true),
+            message:           this.t('snapshots.dialog.creating.message', { snapshot: escapeHtml(name) }, true),
             snapshotEventType: 'create',
           },
         },

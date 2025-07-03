@@ -6,54 +6,77 @@ local_setup() {
     fi
 }
 
-assert_traefik_crd_established() {
-    local jsonpath="{.status.conditions[?(@.type=='Established')].status}"
-    run kubectl get crd traefikservices.traefik.containo.us --output jsonpath="$jsonpath"
+# Get Kubernetes RuntimeClasses; sets $output to the JSON list.
+get_runtime_classes() {
+    # kubectl may emit warnings here; ensure that we don't fall over.
+    run --separate-stderr kubectl get RuntimeClasses --output json
     assert_success || return
-    assert_output 'True'
+
+    if [[ -n $stderr ]]; then
+        # Check that we got a deprecation warning:
+        # Warning: node.k8s.io/v1beta1 RuntimeClass is deprecated in v1.22+, unavailable in v1.25+
+        output=$stderr assert_output --partial deprecated || return
+    fi
+
+    local rtc=$output
+    run jq '.items | length' <<<"$rtc"
+    assert_success || return
+    ((output > 0)) || return
+    echo "$rtc"
+}
+
+create_bats_runtimeclass() {
+    provisioning_script <<EOF
+mkdir -p /var/lib/rancher/k3s/server/manifests
+cat <<YAML >/var/lib/rancher/k3s/server/manifests/zzzz-bats.yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: bats
+handler: bats
+YAML
+EOF
 }
 
 @test 'start k8s without wasm support' {
     factory_reset
+    create_bats_runtimeclass
     start_kubernetes
     wait_for_kubelet
-
-    # The manifests in /var/lib/rancher/k3s/server/manifests are processed
-    # in alphabetical order. So when traefik.yaml has been loaded we know that
-    # rd-runtime.yaml has already been processed.
-    try assert_traefik_crd_established
 }
 
 @test 'verify no runtimeclasses have been defined' {
-    run kubectl get runtimeclasses --output json
+    run try get_runtime_classes
     assert_success
 
-    run jq_output '.items | length'
+    run jq_output --raw-output '.items[0].metadata.name'
     assert_success
-    assert_output 0
+    assert_output 'bats'
 }
 
 @test 'start k8s with wasm support' {
     # TODO We should enable the wasm feature on a running app to make sure the
     # TODO runtime class is defined even after k3s is initially installed.
     factory_reset
+    create_bats_runtimeclass
     start_kubernetes --experimental.container-engine.web-assembly.enabled
     wait_for_kubelet
-    try assert_traefik_crd_established
+    wait_for_traefik
 }
 
 @test 'verify spin runtime class has been defined (and no others)' {
-    run kubectl get runtimeclasses --output json
+    run try get_runtime_classes
     assert_success
 
     rtc=$output
-    run jq --raw-output '.items | length' <<<"$rtc"
+    run jq '.items | length' <<<"$rtc"
     assert_success
-    assert_output 1
+    assert_output 2
 
-    run jq --raw-output '.items[0].metadata.name' <<<"$rtc"
+    run jq --raw-output '.items[].metadata.name' <<<"$rtc"
     assert_success
-    assert_output 'spin'
+    assert_line 'bats'
+    assert_line 'spin'
 }
 
 @test 'deploy sample app' {
@@ -75,23 +98,22 @@ spec:
       runtimeClassName: spin
       containers:
       - name: hello-spin
+        # Newer versions of the sample app have moved from "deislabs" to "spinkube":
+        # ghcr.io/spinkube/containerd-shim-spin/examples/spin-rust-hello:v0.13.0
         image: ghcr.io/deislabs/containerd-wasm-shims/examples/spin-rust-hello:v0.10.0
         command: ["/"]
 EOF
 }
 
-get_host() {
-    if is_windows; then
-        local LB_IP
-        local output='jsonpath={.status.loadBalancer.ingress[0].ip}'
-        LB_IP=$(kubectl get service traefik --namespace kube-system --output "$output")
-        echo "$LB_IP.sslip.io"
-    else
-        echo "localhost"
-    fi
-}
-
 @test 'deploy ingress' {
+    # TODO remove `skip_unless_host_ip` once `traefik_hostname` no longer needs it
+    if is_windows; then
+        skip_unless_host_ip
+    fi
+
+    local host
+    host=$(traefik_hostname)
+
     kubectl apply --filename - <<EOF
 apiVersion: v1
 kind: Service
@@ -112,7 +134,7 @@ metadata:
     traefik.ingress.kubernetes.io/router.entrypoints: web
 spec:
   rules:
-  - host: $(get_host)
+  - host: "$host"
     http:
       paths:
         - path: /
@@ -126,8 +148,16 @@ EOF
 }
 
 @test 'connect to the service' {
+    # TODO remove `skip_unless_host_ip` once `traefik_hostname` no longer needs it
+    if is_windows; then
+        skip_unless_host_ip
+    fi
+
+    local host
+    host=$(traefik_hostname)
+
     # This can take 100s with old versions of traefik, and 15s with newer ones.
-    run try curl --silent --fail "http://$(get_host)/hello"
+    run try curl --silent --fail "http://${host}/hello"
     assert_success
     assert_output "Hello world from Spin!"
 }

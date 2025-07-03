@@ -10,11 +10,12 @@ package reg
 import (
 	"encoding/json"
 	"fmt"
-	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 	"reflect"
 	"strings"
 	"unicode/utf16"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 )
 
 const HkcuRegistryHive = "hkcu"
@@ -63,7 +64,8 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 		sortedStructFields := utils.SortStructFields(structType)
 		scalarReturnedLines := make([]string, 0, numTypedFields)
 		nestedReturnedLines := make([]string, 0)
-		for _, compoundStructField := range sortedStructFields {
+		for i := range sortedStructFields {
+			compoundStructField := &sortedStructFields[i]
 			fieldName := compoundStructField.FieldName
 			valueElement := value.MapIndex(reflect.ValueOf(fieldName))
 			if valueElement.IsValid() {
@@ -152,7 +154,7 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 	case reflect.String:
 		return []string{fmt.Sprintf(`"%s"="%s"`, jsonTag, escape(value.String()))}, nil
 	}
-	return nil, fmt.Errorf("convertToRegFormat: don't know how to process %s kind: %q, (%T), value: %v for var %q\n", path, kind, structType, value, jsonTag)
+	return nil, fmt.Errorf("convertToRegFormat: don't know how to process %s kind: %q, (%T), value: %v for var %q", path, kind, structType, value, jsonTag)
 }
 
 // Encode multi-stringSZ settings in comma-separated ucs2 little-endian bytes
@@ -174,12 +176,12 @@ func stringToMultiStringHexBytes(values []string) string {
 	return strings.Join(hexChars, ",") + ",00,00,00,00"
 }
 
-// JsonToReg - convert the json settings to a reg file
+// JSONToReg - convert the json settings to a reg file
 // @param hiveType: "hklm" or "hkcu"
 // @param profileType: "defaults" or "locked"
 // @param settingsBodyAsJSON - options marshaled as JSON
 // @returns: array of strings, intended for writing to a reg file
-func JsonToReg(hiveType string, profileType string, settingsBodyAsJSON string) ([]string, error) {
+func JSONToReg(hiveType, profileType, settingsBodyAsJSON string) ([]string, error) {
 	var actualSettingsJSON map[string]interface{}
 
 	fullHiveType, ok := map[string]string{"hklm": "HKEY_LOCAL_MACHINE", "hkcu": "HKEY_CURRENT_USER"}[hiveType]
@@ -203,8 +205,10 @@ func JsonToReg(hiveType string, profileType string, settingsBodyAsJSON string) (
 		return nil, err
 	}
 	if len(bodyLines) > 0 {
-		headerLines = append(headerLines, fmt.Sprintf("[%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies"))
-		headerLines = append(headerLines, fmt.Sprintf("[%s\\%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop"))
+		headerLines = append(
+			headerLines,
+			fmt.Sprintf("[%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies"),
+			fmt.Sprintf("[%s\\%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop"))
 	}
 	return append(headerLines, bodyLines...), nil
 }

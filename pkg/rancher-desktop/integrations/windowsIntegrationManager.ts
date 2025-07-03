@@ -2,8 +2,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { findHomeDir } from '@kubernetes/client-node';
+import semver from 'semver';
 
+import DEPENDENCY_VERSIONS from '@pkg/assets/dependencies.yaml';
 import K3sHelper from '@pkg/backend/k3sHelper';
 import { State } from '@pkg/backend/k8s';
 import { Settings, ContainerEngine } from '@pkg/config/settings';
@@ -13,6 +14,7 @@ import mainEvents from '@pkg/main/mainEvents';
 import BackgroundProcess from '@pkg/utils/backgroundProcess';
 import { spawn, spawnFile } from '@pkg/utils/childProcess';
 import clone from '@pkg/utils/clone';
+import Latch from '@pkg/utils/latch';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { executable } from '@pkg/utils/resources';
@@ -46,6 +48,32 @@ export class WSLDistro {
   }
 }
 
+enum SyncStateKey {
+  /** No sync is ongoing. */
+  IDLE,
+  /** A sync is running, but there is no queued sync. */
+  ACTIVE,
+  /** A sync is running, there is also a queued sync that will happen after. */
+  QUEUED,
+}
+
+type SyncState =
+  { state: SyncStateKey.IDLE } |
+  /** The `active` promise will be resolved once the current sync is complete. */
+  { state: SyncStateKey.ACTIVE, active: ReturnType<typeof Latch> } |
+  /** The `queued` promise will be resolved after the current sync +1 is complete. */
+  { state: SyncStateKey.QUEUED, active: ReturnType<typeof Latch>, queued: ReturnType<typeof Latch> };
+
+/**
+ * DiagnosticKey limits the `key` argument of the diagnostic events.
+ */
+type DiagnosticKey =
+  'docker-plugins' |
+  'docker-socket' |
+  'kubeconfig' |
+  'spin-cli' |
+  never;
+
 /**
  * WindowsIntegrationManager manages various integrations on Windows, for both
  * the Win32 host, as well as for each (foreign) WSL distribution.
@@ -67,6 +95,8 @@ export default class WindowsIntegrationManager implements IntegrationManager {
   /** Whether integrations as a whole are enabled. */
   protected enforcing = false;
 
+  protected syncState: SyncState = { state: SyncStateKey.IDLE };
+
   /** Whether the backend is in a state where the processes should run. */
   protected backendReady = false;
 
@@ -75,6 +105,9 @@ export default class WindowsIntegrationManager implements IntegrationManager {
 
   /** Extra debugging arguments for wsl-helper. */
   protected wslHelperDebugArgs: string[] = [];
+
+  /** Singleton instance. */
+  private static instance: WindowsIntegrationManager;
 
   constructor() {
     mainEvents.on('settings-update', (settings) => {
@@ -111,6 +144,13 @@ export default class WindowsIntegrationManager implements IntegrationManager {
     mainEvents.emit('settings-write', {});
   }
 
+  /** Static method to access the singleton instance. */
+  public static getInstance(): WindowsIntegrationManager {
+    WindowsIntegrationManager.instance ||= new WindowsIntegrationManager();
+
+    return WindowsIntegrationManager.instance;
+  }
+
   async enforce(): Promise<void> {
     this.enforcing = true;
     await this.sync();
@@ -122,22 +162,72 @@ export default class WindowsIntegrationManager implements IntegrationManager {
   }
 
   async sync(): Promise<void> {
+    const latch = Latch();
+
+    switch (this.syncState.state) {
+    case SyncStateKey.IDLE:
+      this.syncState = { state: SyncStateKey.ACTIVE, active: latch };
+      break;
+    case SyncStateKey.ACTIVE: {
+      // There is a sync already active; wait for it, then do the re-sync.
+      const { active } = this.syncState;
+
+      this.syncState = {
+        state: SyncStateKey.QUEUED, active, queued: latch,
+      };
+      console.debug('Waiting for previous sync to finish before starting new sync.');
+      await active;
+      // Continue with the rest of the function, in ACTIVE mode.
+      break;
+    }
+    case SyncStateKey.QUEUED:
+      // We already have a queued sync; just wait for that to complete.
+      console.debug('Merging duplicate sync with previous pending sync.');
+
+      return this.syncState.queued;
+    }
     try {
-      const kubeconfigPath = await K3sHelper.findKubeConfigToUpdate('rancher-desktop');
+      let kubeconfigPath: string | undefined;
+
+      try {
+        kubeconfigPath = await K3sHelper.findKubeConfigToUpdate('rancher-desktop');
+        this.diagnostic({ key: 'kubeconfig' });
+      } catch (error) {
+        console.error(`Could not determine kubeconfig: ${ error } - Kubernetes configuration will not be updated.`);
+        this.diagnostic({ key: 'kubeconfig', error });
+        kubeconfigPath = undefined;
+      }
 
       await Promise.all([
         this.syncHostSocketProxy(),
-        this.syncHostDockerPlugins(),
+        this.syncHostDockerPluginConfig(),
         ...(await this.supportedDistros).map(distro => this.syncDistro(distro.name, kubeconfigPath)),
       ]);
     } catch (ex) {
       console.error(`Integration sync: Error: ${ ex }`);
     } finally {
       mainEvents.emit('integration-update', await this.listIntegrations());
+      // TypeScript is being too smart and thinking we can only be ACTIVE here;
+      // but that may be set from concurrent calls to sync().
+      const currentState: SyncState = this.syncState as any;
+
+      switch (currentState.state) {
+      case SyncStateKey.IDLE:
+        // This should never be reached
+        break;
+      case SyncStateKey.ACTIVE:
+        this.syncState = { state: SyncStateKey.IDLE };
+        break;
+      case SyncStateKey.QUEUED:
+        this.syncState = { state: SyncStateKey.ACTIVE, active: currentState.queued };
+        // The sync() that set the state to QUEUED will continue, and eventually
+        // set the state back to IDLE.
+      }
+      latch.resolve();
     }
   }
 
-  async syncDistro(distro: string, kubeconfigPath: string): Promise<void> {
+  async syncDistro(distro: string, kubeconfigPath?: string): Promise<void> {
     let state = this.settings.WSL?.integrations?.[distro] === true;
 
     console.debug(`Integration sync: ${ distro } -> ${ state }`);
@@ -146,6 +236,7 @@ export default class WindowsIntegrationManager implements IntegrationManager {
         this.syncDistroSocketProxy(distro, state),
         this.syncDistroDockerPlugins(distro, state),
         this.syncDistroKubeconfig(distro, kubeconfigPath, state),
+        this.syncDistroSpinCLI(distro, state),
       ]);
     } catch (ex) {
       console.error(`Failed to sync integration for ${ distro }: ${ ex }`);
@@ -154,6 +245,21 @@ export default class WindowsIntegrationManager implements IntegrationManager {
     } finally {
       await this.markIntegration(distro, state);
     }
+  }
+
+  /**
+   * Helper function to trigger a diagnostic report.  If a diagnostic should be
+   * cleared, call this with the error unset.
+   */
+  protected diagnostic(input: {key: DiagnosticKey, distro?: string, error?: unknown}) {
+    const error = input.error instanceof Error ? input.error : input.error ? new Error(`${ input.error }`) : undefined;
+
+    mainEvents.emit('diagnostics-event', {
+      id:     'integrations-windows',
+      key:    input.key,
+      distro: input.distro,
+      error,
+    });
   }
 
   #wslExe = '';
@@ -247,25 +353,22 @@ export default class WindowsIntegrationManager implements IntegrationManager {
   protected async getLinuxToolPath(distro: string, tool: string): Promise<string> {
     // We need to get the Linux path to our helper executable; it is easier to
     // just get WSL to do the transformation for us.
-
-    const logStream = Logging[`wsl-helper.${ distro }`];
-    const { stdout } = await spawnFile(
-      await this.wslExe,
-      ['--distribution', distro, '--exec', '/bin/wslpath', '-a', '-u', tool],
-      { stdio: ['ignore', 'pipe', logStream] },
-    );
-
-    return stdout.trim();
+    return (await this.captureCommand( { distro }, '/bin/wslpath', '-a', '-u', tool)).trim();
   }
 
   protected async syncHostSocketProxy(): Promise<void> {
     const reason = this.dockerSocketProxyReason;
 
     console.debug(`Syncing Win32 socket proxy: ${ reason ? `should not run (${ reason })` : 'should run' }`);
-    if (!reason) {
-      this.windowsSocketProxyProcess.start();
-    } else {
-      await this.windowsSocketProxyProcess.stop();
+    try {
+      if (!reason) {
+        this.windowsSocketProxyProcess.start();
+      } else {
+        await this.windowsSocketProxyProcess.stop();
+      }
+      this.diagnostic({ key: 'docker-socket' });
+    } catch (error) {
+      this.diagnostic({ key: 'docker-socket', error });
     }
   }
 
@@ -290,7 +393,6 @@ export default class WindowsIntegrationManager implements IntegrationManager {
    * distribution is started or stopped, as desired.
    * @param distro The distribution to manage.
    * @param state Whether integration is enabled for the given distro.
-   * @note this function must not throw.
    */
   protected async syncDistroSocketProxy(distro: string, state: boolean) {
     try {
@@ -329,85 +431,125 @@ export default class WindowsIntegrationManager implements IntegrationManager {
           delete this.distroSocketProxyProcesses[distro];
         }
       }
+      this.diagnostic({ key: 'docker-socket', distro });
     } catch (error) {
       console.error(`Error syncing ${ distro } distro socket proxy: ${ error }`);
+      this.diagnostic({
+        key: 'docker-socket', distro, error,
+      });
     }
   }
 
-  protected async syncHostDockerPlugins() {
-    const pluginNames = await this.getHostDockerCliPluginNames();
-
-    await Promise.all(pluginNames.map(name => this.syncHostDockerPlugin(name)));
-  }
-
-  protected async getWslDockerCliPluginNames(): Promise<string[]> {
-    const resourcesBinDir = path.join(paths.resources, 'linux', 'bin');
-
-    return (await fs.promises.readdir(resourcesBinDir)).filter((name) => {
-      return name.startsWith('docker-') && !name.startsWith('docker-credential-');
-    });
-  }
-
-  protected async getHostDockerCliPluginNames(): Promise<string[]> {
-    const resourcesBinDir = path.join(paths.resources, os.platform(), 'bin');
-
-    const pluginNamesWithExe = (await fs.promises.readdir(resourcesBinDir)).filter((name) => {
-      return name.startsWith('docker-') && !name.startsWith('docker-credential-');
-    });
-
-    return pluginNamesWithExe.map(pluginName => pluginName.replace(/\.exe$/, ''));
-  }
-
-  protected async syncHostDockerPlugin(pluginName: string) {
-    const homeDir = findHomeDir();
-
-    if (!homeDir) {
-      throw new Error("Can't find home directory");
-    }
-    const cliDir = path.join(homeDir, '.docker', 'cli-plugins');
-    const srcPath = executable(pluginName as any); // It's an executable in `bin`
-    const cliPath = path.join(cliDir, path.basename(srcPath));
-
-    console.debug(`Syncing host ${ pluginName }: ${ srcPath } -> ${ cliPath }`);
-    await fs.promises.mkdir(cliDir, { recursive: true });
+  protected async syncHostDockerPluginConfig() {
     try {
-      await fs.promises.copyFile(
-        srcPath, cliPath,
-        fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') {
-        console.error(`Failed to copy file ${ srcPath } to ${ cliPath }`, error);
+      const configPath = path.join(os.homedir(), '.docker', 'config.json');
+      let config: { cliPluginsExtraDirs?: string[] } = {};
+
+      try {
+        config = JSON.parse(await fs.promises.readFile(configPath, 'utf-8'));
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+          // If the file does not exist, create it.
+        } else {
+          console.error(`Could not set up docker plugins:`, error);
+          this.diagnostic({ key: 'docker-plugins', error });
+
+          return;
+        }
       }
+
+      // All of the docker plugins are in the `docker-cli-plugins` directory.
+      const binDir = path.join(paths.resources, process.platform, 'docker-cli-plugins');
+
+      if (config.cliPluginsExtraDirs?.includes(binDir)) {
+        // If it's already configured, no need to do so again.
+        return;
+      }
+
+      config.cliPluginsExtraDirs ??= [];
+      config.cliPluginsExtraDirs.push(binDir);
+
+      await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.promises.writeFile(configPath, JSON.stringify(config), 'utf-8');
+      this.diagnostic({ key: 'docker-plugins' });
+    } catch (error) {
+      this.diagnostic({ key: 'docker-plugins', error });
     }
-  }
-
-  protected async syncDistroDockerPlugins(distro: string, state: boolean): Promise<void> {
-    const names = await this.getWslDockerCliPluginNames();
-
-    await Promise.all(names.map(name => this.syncDistroDockerPlugin(distro, name, state)));
   }
 
   /**
-   * syncDistroDockerPlugin ensures that a plugin is accessible in the given distro.
-   * @param distro The distribution to manage.
-   * @param pluginName The plugin to validate.
-   * @param state Whether the plugin should be exposed.
-   * @note this function must not throw.
+   * syncDistroDockerPlugins sets up docker CLI configuration in WSL distros to
+   * use the plugins shipped with Rancher Desktop.
+   * @param distro The distribution to update.
+   * @param state Whether the plugins should be enabled.
    */
-  protected async syncDistroDockerPlugin(distro: string, pluginName: string, state: boolean) {
+  protected async syncDistroDockerPlugins(distro: string, state: boolean): Promise<void> {
     try {
+      const binDir = await this.getLinuxToolPath(distro,
+        path.join(paths.resources, 'linux', 'bin'));
       const srcPath = await this.getLinuxToolPath(distro,
-        path.join(paths.resources, 'linux', 'bin', pluginName));
+        path.join(paths.resources, 'linux', 'docker-cli-plugins'));
       const wslHelper = await this.getLinuxToolPath(distro, executable('wsl-helper-linux'));
+      const args = ['wsl', 'integration', 'docker',
+        `--plugin-dir=${ srcPath }`, `--bin-dir=${ binDir }`, `--state=${ state }`];
 
-      console.debug(`Syncing docker plugin ${ pluginName } for distribution ${ distro }: ${ state }`);
-      await this.execCommand({ distro }, wslHelper, 'wsl', 'integration', 'docker-plugin', `--plugin=${ srcPath }`, `--state=${ state }`);
+      if (this.settings.application?.debug) {
+        args.push('--verbose');
+      }
+
+      await this.execCommand({ distro }, wslHelper, ...args);
+      this.diagnostic({ key: 'docker-plugins', distro });
     } catch (error) {
-      console.error(`Failed to sync ${ distro } docker plugin ${ pluginName }: ${ error }`.trim());
+      console.error(`Failed to set up ${ distro } docker plugins: ${ error }`.trim());
+      this.diagnostic({
+        key: 'docker-plugins', distro, error,
+      });
     }
   }
 
-  protected async syncDistroKubeconfig(distro: string, kubeconfigPath: string, state: boolean) {
+  /**
+   * verifyAllDistrosKubeConfig loops through all the available distros
+   * and checks if the kubeconfig can be managed; if any distro fails
+   * the check, an exception is thrown.
+   */
+  async verifyAllDistrosKubeConfig() {
+    const distros = await this.supportedDistros;
+
+    await Promise.all(distros.map(async(distro) => {
+      await this.verifyDistroKubeConfig(distro.name);
+    }));
+  }
+
+  /**
+   * verifyDistroKubeConfig calls the wsl-helper kubeconfig --verify per distro.
+   * It determines the condition of the kubeConfig from the returned error code.
+   */
+  protected async verifyDistroKubeConfig(distro: string) {
+    try {
+      const wslHelper = await this.getLinuxToolPath(distro, executable('wsl-helper-linux'));
+
+      await this.execCommand({ distro }, wslHelper, 'kubeconfig', '--verify');
+    } catch (err: any) {
+      // Only throw for a specific error code 1, since we control that from the
+      // kubeconfig --verify command. The logic here is to bubble up this error
+      // so that the diagnostic is very specific to this issue. Any other errors
+      // are captured as log messages.
+      if (err && 'code' in err && err.code === 1) {
+        throw new Error(`The kubeConfig contains non-Rancher Desktop configuration in distro ${ distro }`);
+      } else {
+        console.error(`Verifying kubeconfig in distro ${ distro } failed: ${ err }`);
+      }
+    }
+    console.debug(`Verified kubeconfig in the following distro: ${ distro }`);
+  }
+
+  protected async syncDistroKubeconfig(distro: string, kubeconfigPath: string | undefined, state: boolean) {
+    if (!kubeconfigPath) {
+      console.debug(`Skipping syncing ${ distro } kubeconfig: no kubeconfig found`);
+      this.diagnostic({ key: 'kubeconfig', distro });
+
+      return 'Error setting up integration';
+    }
     try {
       console.debug(`Syncing ${ distro } kubeconfig`);
       await this.execCommand(
@@ -423,6 +565,7 @@ export default class WindowsIntegrationManager implements IntegrationManager {
         'kubeconfig',
         `--enable=${ state && this.settings.kubernetes?.enabled }`,
       );
+      this.diagnostic({ key: 'kubeconfig', distro });
     } catch (error: any) {
       if (typeof error?.stdout === 'string') {
         error.stdout = error.stdout.replace(/\0/g, '');
@@ -431,10 +574,39 @@ export default class WindowsIntegrationManager implements IntegrationManager {
         error.stderr = error.stderr.replace(/\0/g, '');
       }
       console.error(`Could not set up kubeconfig integration for ${ distro }:`, error);
+      this.diagnostic({
+        key: 'kubeconfig', distro, error,
+      });
 
       return `Error setting up integration`;
     }
     console.log(`kubeconfig integration for ${ distro } set to ${ state }`);
+  }
+
+  protected async syncDistroSpinCLI(distro: string, state: boolean) {
+    try {
+      if (state && this.settings.experimental?.containerEngine?.webAssembly) {
+        const version = semver.parse(DEPENDENCY_VERSIONS.spinCLI);
+        const env = {
+          KUBE_PLUGIN_VERSION: DEPENDENCY_VERSIONS.spinKubePlugin,
+          SPIN_TEMPLATES_TAG:  (version ? `spin/templates/v${ version.major }.${ version.minor }` : 'unknown'),
+        };
+        const wslenv = Object.keys(env).join(':');
+
+        // wsl-exec is needed to correctly resolve DNS names
+        await this.execCommand({
+          distro,
+          env: {
+            ...process.env, ...env, WSLENV: wslenv,
+          },
+        }, await this.getLinuxToolPath(distro, executable('setup-spin')));
+      }
+      this.diagnostic({ key: 'spin-cli', distro });
+    } catch (error) {
+      this.diagnostic({
+        key: 'spin-cli', distro, error,
+      });
+    }
   }
 
   protected get nonBlacklistedDistros(): Promise<WSLDistro[]> {

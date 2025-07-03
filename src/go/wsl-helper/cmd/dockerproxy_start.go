@@ -1,9 +1,8 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright © 2021 SUSE LLC
-1
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -49,6 +48,8 @@ func init() {
 	dockerproxyStartCmd.Flags().Uint32("port", dockerproxy.DefaultPort, "Vsock port to listen on")
 	dockerproxyStartCmd.Flags().String("endpoint", defaultProxyEndpoint, "Dockerd socket endpoint")
 	dockerproxyStartViper.AutomaticEnv()
-	dockerproxyStartViper.BindPFlags(dockerproxyStartCmd.Flags())
+	if err := dockerproxyStartViper.BindPFlags(dockerproxyStartCmd.Flags()); err != nil {
+		logrus.WithError(err).Fatal("Failed to set up flags")
+	}
 	dockerproxyCmd.AddCommand(dockerproxyStartCmd)
 }

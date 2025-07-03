@@ -1,5 +1,4 @@
 //go:build linux || windows
-// +build linux windows
 
 /*
 Copyright © 2021 SUSE LLC
@@ -27,27 +26,31 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/Masterminds/semver"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/models"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/platform"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/util"
 )
+
+// requestContextKeyType is a type defined for the context key to be unique.
+type requestContextKeyType struct{}
 
 // RequestContextValue contains things we attach to incoming requests
 type RequestContextValue map[interface{}]interface{}
 
 // requestContext is the context key for requestContextValue
-var requestContext = struct{}{}
+var requestContext = requestContextKeyType{}
 
 type containerInspectResponseBody struct {
-	Id string
+	ID string `json:"Id"`
 }
 
 const dockerAPIVersion = "v1.41.0"
@@ -74,7 +77,10 @@ func Serve(endpoint string, dialer func() (net.Conn, error)) error {
 	logWriter := logrus.StandardLogger().Writer()
 	defer logWriter.Close()
 	munger := newRequestMunger()
-	proxy := &httputil.ReverseProxy{
+	proxy := &util.ReverseProxy{
+		Dial: func(string, string) (net.Conn, error) {
+			return dialer()
+		},
 		Director: func(req *http.Request) {
 			logrus.WithField("request", req).
 				WithField("headers", req.Header).
@@ -95,12 +101,6 @@ func Serve(endpoint string, dialer func() (net.Conn, error)) error {
 					WithField("modified request", req).
 					Error("could not munge request")
 			}
-		},
-		Transport: &http.Transport{
-			Dial: func(string, string) (net.Conn, error) {
-				return dialer()
-			},
-			DisableCompression: true, // for debugging
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			logEntry := logrus.WithField("response", resp)
@@ -127,15 +127,18 @@ func Serve(endpoint string, dialer func() (net.Conn, error)) error {
 		ErrorLog: log.New(logWriter, "", 0),
 	}
 
-	contextAttacher := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ctx := context.WithValue(req.Context(), requestContext, &RequestContextValue{})
-		newReq := req.WithContext(ctx)
-		proxy.ServeHTTP(w, newReq)
-	})
+	server := &http.Server{
+		ReadHeaderTimeout: time.Minute,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			ctx := context.WithValue(req.Context(), requestContext, &RequestContextValue{})
+			newReq := req.WithContext(ctx)
+			proxy.ServeHTTP(w, newReq)
+		}),
+	}
 
 	logrus.WithField("endpoint", endpoint).Info("Listening")
 
-	err = http.Serve(listener, contextAttacher)
+	err = server.Serve(listener)
 	if err != nil {
 		logrus.WithError(err).Error("serve exited with error")
 	}
@@ -201,7 +204,7 @@ func (m *requestMunger) MungeRequest(req *http.Request, dialer func() (net.Conn,
 		if err != nil {
 			logEntry.WithField("id", id).WithError(err).Error("unable to resolve container id")
 		} else {
-			templates["id"] = inspect.Id
+			templates["id"] = inspect.ID
 		}
 	}
 
@@ -242,7 +245,7 @@ func (m *requestMunger) MungeResponse(resp *http.Response, dialer func() (net.Co
 		if err != nil {
 			logEntry.WithField("id", id).WithError(err).Error("unable to resolve container id")
 		} else {
-			templates["id"] = inspect.Id
+			templates["id"] = inspect.ID
 		}
 	}
 
@@ -278,10 +281,15 @@ func (m *requestMunger) CanonicalizeContainerID(req *http.Request, id string, di
 	}
 
 	// make the inspect request
-	inspectResponse, err := client.Get(inspectURL.String())
+	inspectRequest, err := http.NewRequestWithContext(req.Context(), "GET", inspectURL.String(), http.NoBody)
 	if err != nil {
 		return nil, err
 	}
+	inspectResponse, err := client.Do(inspectRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer inspectResponse.Body.Close()
 
 	// parse response as json
 	body := containerInspectResponseBody{}
@@ -394,10 +402,10 @@ func convertPattern(apiPath string) *regexp.Regexp {
 	return regexp.MustCompile(pattern)
 }
 
-func RegisterRequestMunger(method, apiPath string, munger requestMungerFunc) {
-	mungerMapping.Lock()
-	defer mungerMapping.Unlock()
-
+// Helper method to get a munger method mapping, or created one if it doesn't
+// exist.
+// This should be called with the mungerMapping lock held.
+func getMungerMethodMapping(method string) *mungerMethodMapping {
 	mapping, ok := mungerMapping.mungers[method]
 	if !ok {
 		mapping = &mungerMethodMapping{
@@ -408,8 +416,15 @@ func RegisterRequestMunger(method, apiPath string, munger requestMungerFunc) {
 		}
 		mungerMapping.mungers[method] = mapping
 	}
-	pattern := convertPattern(apiPath)
-	if pattern == nil {
+	return mapping
+}
+
+func RegisterRequestMunger(method, apiPath string, munger requestMungerFunc) {
+	mungerMapping.Lock()
+	defer mungerMapping.Unlock()
+
+	mapping := getMungerMethodMapping(method)
+	if pattern := convertPattern(apiPath); pattern == nil {
 		mapping.requests[apiPath] = munger
 	} else {
 		mapping.requestPatterns[pattern] = munger
@@ -420,18 +435,8 @@ func RegisterResponseMunger(method, apiPath string, munger responseMungerFunc) {
 	mungerMapping.Lock()
 	defer mungerMapping.Unlock()
 
-	mapping, ok := mungerMapping.mungers[method]
-	if !ok {
-		mapping = &mungerMethodMapping{
-			requests:         make(map[string]requestMungerFunc),
-			requestPatterns:  make(map[*regexp.Regexp]requestMungerFunc),
-			responses:        make(map[string]responseMungerFunc),
-			responsePatterns: make(map[*regexp.Regexp]responseMungerFunc),
-		}
-		mungerMapping.mungers[method] = mapping
-	}
-	pattern := convertPattern(apiPath)
-	if pattern == nil {
+	mapping := getMungerMethodMapping(method)
+	if pattern := convertPattern(apiPath); pattern == nil {
 		mapping.responses[apiPath] = munger
 	} else {
 		mapping.responsePatterns[pattern] = munger

@@ -29,7 +29,7 @@ import yaml from 'yaml';
 
 import { NavPage } from './pages/nav-page';
 import {
-  getAlternateSetting, kubectl, retry, startSlowerDesktop, teardown, waitForRestartVM,
+  getAlternateSetting, kubectl, retry, startSlowerDesktop, teardown,
 } from './utils/TestUtils';
 
 import {
@@ -115,14 +115,11 @@ test.describe('Command server', () => {
 
   test.describe.configure({ mode: 'serial' });
 
-  test.beforeAll(async() => {
-    const result = await startSlowerDesktop(__filename, { kubernetes: { enabled: true } });
-
-    electronApp = result[0] as ElectronApplication;
-    page = result[1] as Page;
+  test.beforeAll(async({ colorScheme }, testInfo) => {
+    [electronApp, page] = await startSlowerDesktop(testInfo, { kubernetes: { enabled: true } });
   });
 
-  test.afterAll(() => teardown(electronApp, __filename));
+  test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
   test('should load Kubernetes API', async() => {
     const navPage = new NavPage(page);
@@ -211,7 +208,7 @@ test.describe('Command server', () => {
     const settings = await resp.json();
     const desiredEnabled = !settings.kubernetes.enabled;
     const desiredEngine = 'flip';
-    const desiredVersion = /1.23.4/.test(settings.kubernetes.version) ? 'v1.19.1' : 'v1.23.4';
+    const desiredVersion = /1.29.4/.test(settings.kubernetes.version) ? 'v1.19.1' : 'v1.29.4';
     const requestedSettings = _.merge({}, settings, {
       version:         CURRENT_SETTINGS_VERSION,
       containerEngine: {
@@ -689,21 +686,19 @@ test.describe('Command server', () => {
           ['experimental.virtual-machine.mount.9p.msize-in-kib', 128],
           ['experimental.virtual-machine.mount.9p.protocol-version', ProtocolVersion.NINEP2000_L],
           ['experimental.virtual-machine.mount.9p.security-model', SecurityModel.NONE],
-          ['experimental.virtual-machine.mount.type', MountType.NINEP],
-          ['experimental.virtual-machine.socket-vmnet', true],
-          ['experimental.virtual-machine.use-rosetta', true],
-          ['experimental.virtual-machine.type', VMType.VZ],
           ['virtual-machine.memory-in-gb', 10],
+          ['virtual-machine.mount.type', MountType.NINEP],
           ['virtual-machine.number-cpus', 10],
+          ['virtual-machine.type', VMType.VZ],
+          ['virtual-machine.use-rosetta', true],
         ],
         darwin: [
-          ['virtual-machine.host-resolver', true],
+          ['kubernetes.ingress.localhost-only', true],
         ],
         linux: [
-          ['experimental.virtual-machine.socket-vmnet', true],
-          ['experimental.virtual-machine.use-rosetta', true],
-          ['experimental.virtual-machine.type', VMType.VZ],
-          ['virtual-machine.host-resolver', true],
+          ['experimental.virtual-machine.proxy.enabled', true],
+          ['virtual-machine.type', VMType.VZ],
+          ['virtual-machine.use-rosetta', true],
         ],
       };
       const unsupportedOptions = unsupportedPrefsByPlatform[os.platform()] ?? [];
@@ -829,7 +824,6 @@ test.describe('Command server', () => {
           switch (os.platform()) {
           case 'darwin':
             body.kubernetes.experimental ??= {};
-            body.kubernetes.experimental.socketVMNet = !oldSettings.experimental.virtualMachine.socketVMNet;
             addPathManagementStrategy(oldSettings, body);
             break;
           case 'linux':
@@ -838,7 +832,6 @@ test.describe('Command server', () => {
           case 'win32':
             body.kubernetes.WSLIntegrations ??= {};
             body.kubernetes.WSLIntegrations.bosco = true;
-            body.kubernetes.hostResolver = !oldSettings.virtualMachine.hostResolver;
           }
           const { stdout, stderr, error } = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(body)]);
 
@@ -898,18 +891,9 @@ test.describe('Command server', () => {
           const result = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(oldSettings)]);
 
           expect(result.stderr).toEqual('');
-          // Have to do this because we don't have any other way to see the current missing progress bar
-          // and have the next  `progressBecomesReady` test pass prematurely.
+          const navPage = new NavPage(page);
 
-          // Wait until progress bar show up. It takes roughly ~60s to start in CI
-          const progressBar = page.locator('.progress');
-
-          await waitForRestartVM(progressBar);
-
-          // Since we just applied new settings, we must wait for the backend to restart.
-          while (await progressBar.count() > 0) {
-            await progressBar.waitFor({ state: 'detached', timeout: Math.round(240_000) });
-          }
+          await navPage.progressBecomesReady();
         });
       });
 

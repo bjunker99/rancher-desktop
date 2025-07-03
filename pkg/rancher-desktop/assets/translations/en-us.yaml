@@ -190,18 +190,25 @@ marketplace:
   banners:
     install: Extension {name} has been installed.
     uninstall: Extension {name} has been removed.
-  sidebar:
-    installButton:
-      label: Install
-      loading: Installing...
-    uninstallButton:
-      label: Remove
-      loading: Removing...
+  labels:
+    install: Install
+    uninstall: Remove
+    upgrade: Upgrade
+  loading:
+    install: Installing...
+    uninstall: Removing...
+    upgrade: Upgrading...
   moreInfo: More information
 containers:
   title: Containers
   sortableTables:
     noRows: There are no containers to show
+  logs:
+    title: Container Logs
+    loading: Loading container logs...
+    noLogs: No logs available
+    refresh: Refresh
+    fetchError: Failed to fetch container logs
   manage:
     table:
       header:
@@ -385,9 +392,6 @@ virtualMachine:
       placeholder: Hostname to not redirect to the proxy
       errors:
         duplicate: Error, item is duplicate.
-  socketVmNet:
-    legend: Enable socket-vmnet
-    label: Use socket-vmnet instead of vde-vmnet
   type:
     legend: Virtual Machine Type
     options:
@@ -406,15 +410,15 @@ containerEngine:
   options:
     moby:
       label: dockerd (moby)
-      description: Docker API; use with Docker CLI and k3d.
+      description: Docker API; use with Docker CLI.
     containerd:
       label: containerd
       description: Namespaces for container images; use with nerdctl.
 
 webAssembly:
-  label: Web Assembly (wasm)
+  label: WebAssembly (Wasm)
   enabled: Enabled
-  description: Please read the documentation before enabling the experimental web assembly feature!
+  description: Please read the documentation before enabling the experimental WebAssembly feature!
 
 allowedImages:
   label: Allowed Image Patterns
@@ -4775,12 +4779,12 @@ snapshots:
         cancel: 'Cancel'
     restoring:
       header: 'Restoring {snapshot}'
-      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is restored. This may take some time depending on your machine's resources.<br/><br/>Rancher Desktop will be temporarily unavailable during this operation. Once completed, the VM will restart with the {snapshot} snapshot active."
+      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is being restored. This may take some time depending on your machine's resources.<br/><br/>Rancher Desktop will be temporarily unavailable during this operation. Once completed, the VM will restart with the {snapshot} snapshot active."
       actions:
         cancel: 'Cancel'
     creating:
       header: 'Creating {snapshot}'
-      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is created.'<br/>'This may take some time depending on your machine's resources.'<br/>'Rancher Desktop will be temporarily unavailable during this operation.'<br/><br/>'Once the snapshot is complete, the VM will restart."
+      message: "Please wait while snapshot '<b>'{snapshot}'</b>' is being created.'<br/>'This may take some time depending on your machine's resources.'<br/>'Rancher Desktop will be temporarily unavailable during this operation.'<br/><br/>'Once the snapshot is complete, the VM will restart."
       actions:
         cancel: 'Cancel'
     buttons:
@@ -4867,6 +4871,7 @@ extensions:
   icon: icon-extension
   installed:
     list:
+      upgrade: Upgrade
       uninstall: Remove
     emptyState:
       icon: icon-extension
@@ -4891,7 +4896,8 @@ preferences:
   locked:
     tooltip: Locked due to organization's policy
   incompatibleTypeWarningPre: 'The option requires'
-  incompatibleTypeWarningPost: 'to be selected.'
+  incompatibleTypeWarningPostSelected: 'to be selected.'
+  incompatibleTypeWarningPostDisabled: 'to be unselected.'
   incompatiblePrefWarningOr: 'or'
 ##############################
 ### Integrations Page

@@ -11,7 +11,7 @@ local_setup() {
     ALLOWED_EXTENSION_TAG="0.0.7"
     FORBIDDEN_EXTENSION_TAG="0.0.5"
     FORBIDDEN_EXTENSION="ignatandrei/blockly-automation" # spellcheck-ignore-line
-    KUBERNETES_RANDOM_VERSION="1.23.5"
+    KUBERNETES_RANDOM_VERSION="1.29.5"
 
     # profile settings should be the opposite of the default config
     if using_docker; then
@@ -74,17 +74,20 @@ verify_settings() {
 
     run get_setting .kubernetes.version
     "${assert}_output" "$LOCKED_KUBERNETES_VERSION"
-    refute_output "$DEFAULTS_KUBERNETES_VERSION"
+    "${refute}_output" "$DEFAULTS_KUBERNETES_VERSION"
 }
 
 install_extensions() {
-    run rdctl extension install "$FORBIDDEN_EXTENSION"
+    # Extension install doesn't work until startup is fully complete.
+    wait_for_backend
+
+    RD_TIMEOUT=120s run rdctl extension install "$FORBIDDEN_EXTENSION"
     "${refute}_success"
 
-    run rdctl extension install "$ALLOWED_EXTENSION_NAME:$FORBIDDEN_EXTENSION_TAG"
+    RD_TIMEOUT=120s run rdctl extension install "$ALLOWED_EXTENSION_NAME:$FORBIDDEN_EXTENSION_TAG"
     "${refute}_success"
 
-    run rdctl extension install "${LOCKED_EXTENSIONS_ALLOWED_LIST[0]}"
+    RD_TIMEOUT=120s run rdctl extension install "${LOCKED_EXTENSIONS_ALLOWED_LIST[0]}"
     assert_success
 }
 
@@ -93,6 +96,8 @@ install_extensions() {
 }
 
 @test 'start up with NO profiles' {
+    assert_not_equal "$DEFAULTS_KUBERNETES_VERSION" "$LOCKED_KUBERNETES_VERSION"
+    assert_not_equal "$KUBERNETES_RANDOM_VERSION" "$LOCKED_KUBERNETES_VERSION"
     RD_USE_PROFILE=false
     RD_USE_IMAGE_ALLOW_LIST=false
     start_application
@@ -189,7 +194,7 @@ api_set() {
     assert_failure
     assert_output --partial 'field "application.extensions.allowed.list" is locked'
 
-    run api_set '"kubernetes": {"version": "1.16.15"}'
+    run api_set '"kubernetes": {"version": "'"$KUBERNETES_RANDOM_VERSION"'"}'
     assert_failure
     assert_output --partial 'field "kubernetes.version" is locked'
 }

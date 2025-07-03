@@ -10,18 +10,18 @@ import fs from 'fs';
 import * as path from 'path';
 
 import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses';
-import { LinuxPackager } from 'app-builder-lib/out/linuxPackager';
-import { LinuxTargetHelper } from 'app-builder-lib/out/targets/LinuxTargetHelper';
 import { executeAppBuilder, log } from 'builder-util';
 import {
   AfterPackContext, Arch, build, CliOptions, Configuration, LinuxTargetSpecificOptions,
 } from 'electron-builder';
 import _ from 'lodash';
+import plist from 'plist';
 import yaml from 'yaml';
 
 import buildUtils from './lib/build-utils';
 import buildInstaller, { buildCustomAction } from './lib/installer-win32';
 
+import { spawnFile } from '@pkg/utils/childProcess';
 import { ReadWrite } from '@pkg/utils/typeUtils';
 
 class Builder {
@@ -58,6 +58,7 @@ class Builder {
     const exeName = `${ context.packager.appInfo.productFilename }${ extension }`;
     const exePath = path.join(context.appOutDir, exeName);
     const resetAdHocDarwinSignature = context.arch === Arch.arm64;
+    const integrityEnabled = context.electronPlatformName === 'darwin';
 
     await flipFuses(
       exePath,
@@ -68,7 +69,7 @@ class Builder {
         [FuseV1Options.EnableCookieEncryption]:                false,
         [FuseV1Options.EnableNodeOptionsEnvironmentVariable]:  false,
         [FuseV1Options.EnableNodeCliInspectArguments]:         false,
-        [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
+        [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: integrityEnabled,
         [FuseV1Options.OnlyLoadAppFromAsar]:                   true,
       },
     );
@@ -80,6 +81,8 @@ class Builder {
    * files.
    */
   protected async writeLinuxDesktopFile(context: AfterPackContext) {
+    const { LinuxPackager } = await import('app-builder-lib/out/linuxPackager');
+    const { LinuxTargetHelper } = await import('app-builder-lib/out/targets/LinuxTargetHelper');
     const config = context.packager.config.linux;
 
     if (!(context.packager instanceof LinuxPackager) || !config) {
@@ -97,9 +100,49 @@ class Builder {
     await helper.writeDesktopEntry(options, context.packager.executableName, destination);
   }
 
+  /**
+   * Edit the application's `Info.plist` file to remove the UsageDescription
+   * keys; there is no reason for the application to get any of those permissions.
+   */
+  protected async removeMacUsageDescriptions(context: AfterPackContext) {
+    const { MacPackager } = await import('app-builder-lib/out/macPackager');
+    const { packager } = context;
+    const config = packager.config.mac;
+
+    if (!(packager instanceof MacPackager) || !config) {
+      return;
+    }
+
+    const { productFilename } = packager.appInfo;
+    const appPath = path.join(context.appOutDir, `${ productFilename }.app`);
+    const plistPath = path.join(appPath, 'Contents', 'Info.plist');
+    const plistContents = await fs.promises.readFile(plistPath, 'utf-8');
+    const plistData = plist.parse(plistContents);
+
+    if (typeof plistData !== 'object' || !('CFBundleName' in plistData)) {
+      return;
+    }
+    const plistCopy: Record<string, plist.PlistValue> = structuredClone(plistData);
+
+    for (const key in plistData) {
+      if (/^NS.*UsageDescription$/.test(key)) {
+        delete plistCopy[key];
+      }
+    }
+    await fs.promises.writeFile(plistPath, plist.build(plistCopy), 'utf-8');
+
+    // Because we modified the Info.plist, we need to re-sign the app.  This is
+    // just using ad-hoc signing.  Note that this will fail on x86_64, so ignore
+    // it there.
+    if (context.arch !== Arch.x64) {
+      await spawnFile('codesign', ['--sign', '-', '--force', '--verbose', appPath], { stdio: 'inherit' });
+    }
+  }
+
   protected async afterPack(context: AfterPackContext) {
     await this.flipFuses(context);
     await this.writeLinuxDesktopFile(context);
+    await this.removeMacUsageDescriptions(context);
   }
 
   async package(): Promise<CliOptions> {
@@ -117,6 +160,10 @@ class Builder {
       linux:  'linux',
     } as const)[process.platform as string];
 
+    if (!electronPlatform) {
+      throw new Error(`Packaging for ${ process.platform } is not supported`);
+    }
+
     switch (electronPlatform) {
     case 'linux':
       await this.createLinuxResources(finalBuildVersion);
@@ -124,6 +171,23 @@ class Builder {
     case 'win':
       await this.createWindowsResources(distDir);
       break;
+    }
+
+    // When there are files (e.g., extraFiles or extraResources) specified at both
+    // the top-level and platform-specific levels, we need to combine them
+    // and place the combined list at the top level. This approach enables us to have
+    // platform-specific exclusions, since the two lists are initially processed
+    // separately and then merged together afterward.
+    for (const key of ['files', 'extraFiles', 'extraResources'] as const) {
+      const section = config[electronPlatform];
+      const items = config[key];
+      const overrideItems = section?.[key];
+
+      if (!section || !Array.isArray(items) || !Array.isArray(overrideItems)) {
+        continue;
+      }
+      config[key] = items.concat(overrideItems);
+      delete section[key];
     }
 
     _.set(config, 'extraMetadata.version', finalBuildVersion);
@@ -156,10 +220,12 @@ class Builder {
 
   async buildInstaller(config: CliOptions) {
     const appDir = path.join(buildUtils.distDir, 'win-unpacked');
+    const { version } = (config.config as any).extraMetadata;
+    const installerPath = path.join(buildUtils.distDir, `Rancher.Desktop.Setup.${ version }.msi`);
 
     if (config.win && !process.argv.includes('--zip')) {
       // Only build installer if we're not asked not to.
-      await buildInstaller(buildUtils.distDir, appDir);
+      await buildInstaller(buildUtils.distDir, appDir, installerPath);
     }
   }
 
@@ -182,6 +248,7 @@ class Builder {
     await executeAppBuilder(['rcedit', '--args', JSON.stringify(rceditArgs)], undefined, undefined, 3);
 
     // Create the custom action for the installer
+    log.info('building Windows Installer custom action...');
     const customActionFile = await buildCustomAction();
 
     // Wait for the virus scanner to be done with the new DLL file

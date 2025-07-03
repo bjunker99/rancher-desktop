@@ -10,8 +10,8 @@ import (
 
 // This file contains handlers for specific commands.
 
-// imageBuildHandler handles `nerdctl image build`
-func imageBuildHandler(c *commandDefinition, args []string, argHandlers argHandlersType) (*parsedArgs, error) {
+// builderBuildHandler handles `nerdctl image build`
+func builderBuildHandler(c *commandDefinition, args []string, argHandlers argHandlersType) (*parsedArgs, error) {
 	// The first argument is the directory to build; the rest are ignored.
 	if len(args) < 1 {
 		// This will return an error
@@ -124,6 +124,7 @@ functionLoop:
 			hostPathIndex := i
 			switch result {
 			case hostPathNeither:
+				//nolint:gocritic // We break the loop once we are done appending
 				resultArgs = append(resultArgs, paths...)
 				break functionLoop
 			case hostPathUnknown:
@@ -143,6 +144,7 @@ functionLoop:
 				return nil, err
 			}
 			paths[hostPathIndex] = newPath
+			//nolint:gocritic // We break the loop once we are done appending
 			resultArgs = append(resultArgs, paths...)
 			break functionLoop
 		}

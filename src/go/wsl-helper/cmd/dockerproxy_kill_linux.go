@@ -17,13 +17,13 @@ limitations under the License.
 package cmd
 
 import (
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/process"
-
 	// Pull in to register the mungers
 	_ "github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/mungers"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/process"
 )
 
 var dockerproxyKillViper = viper.New()
@@ -43,6 +43,8 @@ var dockerproxyKillCmd = &cobra.Command{
 
 func init() {
 	dockerproxyKillViper.AutomaticEnv()
-	dockerproxyKillViper.BindPFlags(dockerproxyKillCmd.Flags())
+	if err := dockerproxyKillViper.BindPFlags(dockerproxyKillCmd.Flags()); err != nil {
+		logrus.WithError(err).Fatal("Failed to set up flags")
+	}
 	dockerproxyCmd.AddCommand(dockerproxyKillCmd)
 }

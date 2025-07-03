@@ -4,9 +4,6 @@ on:
     - cron: '55 8 * * *'
   workflow_dispatch: {}
 
-permissions:
-  issues: write
-
 jobs:
   check-for-token:
     outputs:
@@ -22,23 +19,17 @@ jobs:
     needs: check-for-token
     if: needs.check-for-token.outputs.has-token == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '18.16.x'
-          cache: yarn
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '^1.21'
-          cache-dependency-path: src/go/**/go.sum
-
-      - run: yarn install --frozen-lockfile
+      - uses: ./.github/actions/yarn-install
 
       - run: yarn dcmonitor
         env:
-          GITHUB_TOKEN: ${{ secrets.RUN_WORKFLOW_FROM_WORKFLOW }}
+          GITHUB_CREATE_TOKEN: ${{ secrets.RUN_WORKFLOW_FROM_WORKFLOW }}
+          GITHUB_TOKEN: ${{ github.token }}

@@ -12,13 +12,11 @@ using_docker() {
 }
 
 ########################################################################
-: "${RD_KUBERNETES_VERSION:=1.23.6}"
+: "${RD_RANCHER_IMAGE_TAG:=}"
 
-########################################################################
-: "${RD_KUBERNETES_PREV_VERSION:=1.22.7}"
-
-########################################################################
-: "${RD_RANCHER_IMAGE_TAG:=v2.7.0}"
+rancher_image_tag() {
+    echo "${RANCHER_IMAGE_TAG:-v2.7.0}"
+}
 
 ########################################################################
 # Defaults to true, except in the helper unit tests, which default to false
@@ -82,6 +80,16 @@ using_image_allow_list() {
 : "${RD_USE_PROFILE:=false}"
 
 ########################################################################
+# RD_TIMEOUT is for internal use. It is used to configure timeouts for
+# the `rdctl` command, and should not be set outside of specific
+# commands.
+: "${RD_TIMEOUT:=}"
+
+if [[ -n $RD_TIMEOUT ]]; then
+    fatal "RD_TIMEOUT should not be set"
+fi
+
+########################################################################
 : "${RD_USE_VZ_EMULATION:=false}"
 
 using_vz_emulation() {
@@ -104,32 +112,6 @@ if using_windows_exe && ! is_windows; then
 fi
 
 ########################################################################
-: "${RD_USE_NETWORKING_TUNNEL:=false}"
-
-using_networking_tunnel() {
-    is_true "$RD_USE_NETWORKING_TUNNEL"
-}
-
-if using_networking_tunnel && ! is_windows; then
-    fatal "RD_USE_NETWORKING_TUNNEL only works on Windows"
-fi
-
-########################################################################
-: "${RD_USE_SOCKET_VMNET:=false}"
-
-using_socket_vmnet() {
-    is_true "$RD_USE_SOCKET_VMNET"
-}
-
-if using_socket_vmnet && ! is_macos; then
-    fatal "RD_USE_SOCKET_VMNET only works on macOS"
-fi
-
-if using_socket_vmnet && sudo_needs_password; then
-    fatal "RD_USE_SOCKET_VMNET requires passwordless sudo"
-fi
-
-########################################################################
 if is_unix; then
     : "${RD_MOUNT_TYPE:=reverse-sshfs}"
 
@@ -137,6 +119,9 @@ if is_unix; then
 
     if [ "$RD_MOUNT_TYPE" = "virtiofs" ] && ! using_vz_emulation; then
         fatal "RD_MOUNT_TYPE=virtiofs only works with VZ emulation"
+    fi
+    if [ "$RD_MOUNT_TYPE" = "9p" ] && using_vz_emulation; then
+        fatal "RD_MOUNT_TYPE=9p only works with qemu emulation"
     fi
 else
     : "${RD_MOUNT_TYPE:=}"
@@ -202,6 +187,14 @@ using_dev_mode() {
 }
 
 ########################################################################
+# Kubernetes versions
+
+# The main Kubernetes version to test.
+: "${RD_KUBERNETES_VERSION:=1.29.6}"
+
+# A secondary Kubernetes version; this is used for testing upgrades.
+: "${RD_KUBERNETES_ALT_VERSION:=1.25.7}"
+
 # RD_K3S_VERSIONS specifies a list of k3s versions. foreach_k3s_version()
 # can dynamically register a test to run once for each version in the
 # list. Only versions between RD_K3S_MIN and RD_K3S_MAX (inclusively)
@@ -211,9 +204,9 @@ using_dev_mode() {
 # "all" will fetch the list of all k3s releases from GitHub
 # "latest" will fetch the list of latest versions from the release channel
 
-: "${RD_K3S_MIN:=1.0.0}"
+: "${RD_K3S_MIN:=1.25.3}"
 : "${RD_K3S_MAX:=1.99.0}"
-: "${RD_K3S_VERSIONS:=$RD_KUBERNETES_PREV_VERSION}"
+: "${RD_K3S_VERSIONS:=$RD_KUBERNETES_VERSION}"
 
 validate_semver RD_K3S_MIN
 validate_semver RD_K3S_MAX
@@ -229,3 +222,14 @@ if ! load_var RD_K3S_VERSIONS; then
 
     save_var RD_K3S_VERSIONS
 fi
+
+########################################################################
+# RD_VPN_TEST_IMAGE specifies the URL used by the split DNS test to access
+# the private registry. Defaults to empty. Can be set via environment
+# variable when running tests.
+
+: "${RD_VPN_TEST_IMAGE:=}"
+
+using_vpn_test_image() {
+    [[ -n $RD_VPN_TEST_IMAGE ]]
+}

@@ -1,6 +1,11 @@
 wait_for_shell() {
     if is_windows; then
-        try --max 24 --delay 5 rdctl shell true
+        try --max 48 --delay 5 rdctl shell grep ID= /etc/os-release
+        if using_systemd; then
+            try --max 24 --delay 5 rdctl shell test -f /var/run/lima-boot-done
+            try --max 24 --delay 5 rdctl shell systemctl is-active rancher-desktop.target
+            try --max 48 --delay 5 rdctl shell sudo systemctl is-system-running --wait
+        fi
     else
         # Be at the root directory to avoid issues with limactl automatic
         # changing to the current directory, which might not exist.
@@ -23,7 +28,7 @@ pkill_by_path() {
 clear_iptables_chain() {
     local chain=$1
     local rule
-    wsl sudo iptables -L | awk '/^Chain ${chain}/ {print $2}' | while IFS= read -r rule; do
+    wsl sudo iptables -L | awk "/^Chain ${chain}/ {print \$2}" | while IFS= read -r rule; do
         wsl sudo iptables -X "$rule"
     done
 }
@@ -152,7 +157,6 @@ if (/^--/) {
     # fixup acronyms
     s/memoryInGb/memoryInGB/;
     s/numberCpus/numberCPUs/;
-    s/socketVmnet/socketVMNet/;
     s/--wsl/--WSL/;
 }
 print;
@@ -171,16 +175,12 @@ start_container_engine() {
     if [ -n "$RD_CONTAINER_ENGINE" ]; then
         args+=(--container-engine.name="$RD_CONTAINER_ENGINE")
     fi
-    if using_socket_vmnet; then
-        args+=(--experimental.virtual-machine.socket-vmnet)
-        admin_access=true
-    fi
     if is_unix; then
         args+=(
             --application.admin-access="$admin_access"
             --application.path-management-strategy rcfiles
             --virtual-machine.memory-in-gb 6
-            --experimental.virtual-machine.mount.type="$RD_MOUNT_TYPE"
+            --virtual-machine.mount.type="$RD_MOUNT_TYPE"
         )
     fi
     if [ "$RD_MOUNT_TYPE" = "9p" ]; then
@@ -191,13 +191,10 @@ start_container_engine() {
             --experimental.virtual-machine.mount.9p.security-model="$RD_9P_SECURITY_MODEL"
         )
     fi
-    if using_networking_tunnel; then
-        args+=(--experimental.virtual-machine.networking-tunnel)
-    fi
     if using_vz_emulation; then
-        args+=(--experimental.virtual-machine.type vz)
+        args+=(--virtual-machine.type vz)
         if is_macos aarch64; then
-            args+=(--experimental.virtual-machine.use-rosetta)
+            args+=(--virtual-machine.use-rosetta)
         fi
     fi
 
@@ -209,6 +206,10 @@ start_container_engine() {
         registry="ghcr.io"
     fi
     if is_true "${RD_USE_PROFILE:-}"; then
+        if ! profile_exists; then
+            create_profile
+        fi
+        add_profile_int "version" 7
         if is_windows; then
             # Translate any dots in the distro name into $RD_PROTECTED_DOT (e.g. "Ubuntu-22.04")
             # so that they are not treated as setting separator characters.
@@ -244,7 +245,7 @@ EOF
 start_kubernetes() {
     start_container_engine \
         --kubernetes.enabled \
-        --kubernetes.version "$RD_KUBERNETES_PREV_VERSION" \
+        --kubernetes.version "$RD_KUBERNETES_VERSION" \
         "$@"
 }
 
@@ -285,6 +286,24 @@ launch_the_application() {
     fi
 }
 
+# Write a provisioning script that will be executed during VM startup.
+# Only a single script can be defined, and scripts are deleted by factory-reset.
+# The script must be provided via STDIN and not as a parameter.
+provisioning_script() {
+    if is_windows; then
+        mkdir -p "$PATH_APP_HOME/provisioning"
+        cat >"$PATH_APP_HOME/provisioning/bats.start"
+    else
+        mkdir -p "$LIMA_HOME/_config"
+        cat <<EOF >"$LIMA_HOME/_config/override.yaml"
+provision:
+- mode: system
+  script: |
+$(sed 's/^/    /')
+EOF
+    fi
+}
+
 get_container_engine_info() {
     run ctrctl info
     echo "$output"
@@ -306,11 +325,55 @@ docker_context_exists() {
     assert_output "$RD_DOCKER_CONTEXT"
 }
 
+# Check if the VM is using systemd (instead of OpenRC).
+using_systemd() {
+    [[ -n ${_RD_USING_SYSTEMD:-} ]] || load_var _RD_USING_SYSTEMD || true
+    if [[ -z ${_RD_USING_SYSTEMD:-} ]]; then
+        # `systemctl whoami` contacts the systemd init to check things, so if
+        # it succeeds we're using systemd.  On alpine-based systems, the
+        # `systemctl` command would be missing so this still applies.
+        if rdctl shell /usr/bin/systemctl whoami &>/dev/null; then
+            _RD_USING_SYSTEMD=true
+        else
+            _RD_USING_SYSTEMD=false
+        fi
+        save_var _RD_USING_SYSTEMD
+    fi
+    is_true "${_RD_USING_SYSTEMD}"
+}
+
+# Manage a service in the vm.
+# service_control [--ifstarted] $SERVICE start|stop|restart
+service_control() {
+    local if_started
+    if [[ ${1:-} == "--ifstarted" ]]; then
+        if_started=$1
+        shift
+    fi
+    local service=$1 action=$2
+    if using_systemd; then
+        if [[ -n $ifstarted && $action == restart ]]; then
+            rdsudo systemctl try-restart "$service"
+        else
+            rdsudo systemctl "$action" "$service"
+        fi
+    else
+        # shellcheck disable=2086 # the argument may expand to nothing.
+        rdsudo rc-service ${if_started:-} "$service" "$action"
+    fi
+}
+
 get_service_pid() {
     local service_name=$1
-    run rdshell sh -c "RC_SVCNAME=$service_name /lib/rc/bin/service_get_value pidfile"
-    assert_success || return
-    rdshell cat "$output"
+    if using_systemd; then
+        RD_TIMEOUT=10s run rdshell systemctl show --property MainPID --value "$service_name.service"
+        assert_success || return
+        echo "$output"
+    else
+        RD_TIMEOUT=10s run rdshell sh -c "RC_SVCNAME=$service_name /usr/libexec/rc/bin/service_get_value pidfile"
+        assert_success || return
+        RD_TIMEOUT=10s rdshell cat "$output"
+    fi
 }
 
 assert_service_pid() {
@@ -321,20 +384,42 @@ assert_service_pid() {
     assert_output "$expected_pid"
 }
 
+# Check that the given service does not have the given PID.  It is acceptable
+# for the service to not be running.
 refute_service_pid() {
-    ! assert_service_pid "$@"
+    local service_name=$1
+    local unexpected_pid=$2
+    run get_service_pid "$service_name"
+    if [ "$status" -eq 0 ]; then
+        refute_output "$unexpected_pid"
+    fi
 }
 
 assert_service_status() {
     local service_name=$1
     local expect=$2
 
-    run rdsudo rc-service "$service_name" status
-    # rc-service report non-zero status (3) when the service is stopped
-    if [[ $expect == started ]]; then
-        assert_success || return
+    if using_systemd; then
+        local mapped_status
+        case $expect in
+        started) mapped_status=active ;;
+        stopped) mapped_status=inactive ;;
+        *) fail "Status $expect is unsupported" ;;
+        esac
+        RD_TIMEOUT=10s run rdsudo systemctl is-active "$service_name"
+        # `systemctl is-active` returns 0 on active, and non-0 on non-active.
+        if [[ $expect == started ]]; then
+            assert_success || return
+        fi
+        assert_line "$mapped_status"
+    else
+        RD_TIMEOUT=10s run rdsudo rc-service "$service_name" status
+        # rc-service report non-zero status (3) when the service is stopped
+        if [[ $expect == started ]]; then
+            assert_success || return
+        fi
+        assert_output --partial "status: ${expect}"
     fi
-    assert_output --partial "status: ${expect}"
 }
 
 wait_for_service_status() {
@@ -353,11 +438,12 @@ wait_for_container_engine() {
     CALLER=$(this_function)
 
     trace "waiting for api /settings to be callable"
-    try --max 30 --delay 5 rdctl api /settings
+    RD_TIMEOUT=10s try --max 30 --delay 5 rdctl api /settings
 
     if using_docker; then
+        wait_for_service_status docker started
         trace "waiting for docker context to exist"
-        try --max 30 --delay 5 docker_context_exists
+        try --max 30 --delay 10 docker_context_exists
     else
         wait_for_service_status buildkitd started
     fi
@@ -366,10 +452,27 @@ wait_for_container_engine() {
     try --max 12 --delay 10 get_container_engine_info
 }
 
+# Wait fot the extension manager to be initialized.
+wait_for_extension_manager() {
+    trace "waiting for extension manager to be ready"
+    # We want to match specific error strings, so we can't use try() directly.
+    local count=0 max=30 message
+    while true; do
+        run --separate-stderr rdctl api /extensions
+        if ((status == 0 || ++count >= max)); then
+            break
+        fi
+        message=$(jq_output .message)
+        output="$message" assert_output "503 Service Unavailable"
+        sleep 10
+    done
+    trace "$count/$max tries: wait_for_extension_manager"
+}
+
 # See definition of `State` in
 # pkg/rancher-desktop/backend/backend.ts for an explanation of each state.
 assert_backend_available() {
-    run rdctl api /v1/backend_state
+    RD_TIMEOUT=10s run rdctl api /v1/backend_state
     if ((status == 0)); then
         run jq_output .vmState
         case "$output" in

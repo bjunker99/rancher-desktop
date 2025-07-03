@@ -56,6 +56,12 @@ import * as window from '@pkg/window';
 import { closeDashboard, openDashboard } from '@pkg/window/dashboard';
 import { openPreferences, preferencesSetDirtyFlag } from '@pkg/window/preferences';
 
+// https://www.electronjs.org/docs/latest/breaking-changes#changed-gtk-4-is-default-when-running-gnome
+if (process.platform === 'linux') {
+  Electron.app.commandLine.appendSwitch('gtk-version', '3');
+}
+
+Electron.app.setPath('userData', path.join(paths.appHome, 'electron'));
 Electron.app.setPath('cache', paths.cache);
 Electron.app.setAppLogsPath(paths.logs);
 
@@ -109,6 +115,16 @@ let pendingRestartContext: CommandWorkerInterface.CommandContext | undefined;
 let httpCommandServer: HttpCommandServer|null = null;
 const httpCredentialHelperServer = new HttpCredentialHelperServer();
 
+if (process.platform === 'linux') {
+  // On Linux, put Electron into a new process group so that we can more
+  // reliably kill processes we spawn from extensions.
+  try {
+    require('posix-node').setpgid(0, 0);
+  } catch (ex) {
+    console.error(`Ignoring error setting process group: ${ ex }`);
+  }
+}
+
 // Scheme must be registered before the app is ready
 Electron.protocol.registerSchemesAsPrivileged([
   { scheme: 'app', privileges: { secure: true, standard: true } },
@@ -143,6 +159,12 @@ mainEvents.on('settings-update', async(newSettings) => {
   }
   k8smanager.debug = runInDebugMode;
 
+  if (gone) {
+    console.debug('Suppressing settings-update because app is quitting');
+
+    return;
+  }
+
   await setPathManager(newSettings.application.pathManagementStrategy);
   await pathManager.enforce();
 
@@ -166,8 +188,12 @@ mainEvents.handle('settings-fetch', () => {
 Electron.protocol.registerSchemesAsPrivileged([{ scheme: 'app' }, {
   scheme:     'x-rd-extension',
   privileges: {
-    standard:        true,
-    supportFetchAPI: true,
+    standard:            true,
+    secure:              true,
+    bypassCSP:           true,
+    allowServiceWorkers: true,
+    supportFetchAPI:     true,
+    corsEnabled:         true,
   },
 }]);
 
@@ -397,7 +423,7 @@ async function initUI() {
   Electron.app.setAboutPanelOptions({
     // TODO: Update this to 2021-... as dev progresses
     // also needs to be updated in electron-builder.yml
-    copyright:          'Copyright © 2021-2023 SUSE LLC',
+    copyright:          'Copyright © 2021-2025 SUSE LLC',
     applicationName:    `${ Electron.app.name } by SUSE`,
     applicationVersion: `Version ${ await getVersion() }`,
     iconPath:           path.join(paths.resources, 'icons', 'logo-square-512.png'),
@@ -552,9 +578,9 @@ async function startK8sManager() {
   }
   await k8smanager.start(cfg);
 
-  const getEM = (await import('@pkg/main/extensions/manager')).default;
+  const { initializeExtensionManager } = await import('@pkg/main/extensions/manager');
 
-  await getEM(k8smanager.containerEngineClient, cfg);
+  await initializeExtensionManager(k8smanager.containerEngineClient, cfg);
   window.send('extensions/changed');
 }
 
@@ -602,14 +628,9 @@ Electron.app.on('before-quit', async(event) => {
   httpCredentialHelperServer.closeServer();
 
   try {
+    await mainEvents.tryInvoke('extensions/shutdown');
     await k8smanager?.stop();
-    try {
-      await mainEvents.invoke('shutdown-integrations');
-    } catch (ex) {
-      if (!`${ ex }`.includes('No handlers registered')) {
-        throw ex;
-      }
-    }
+    await mainEvents.tryInvoke('shutdown-integrations');
 
     console.log(`2: Child exited cleanly.`);
   } catch (ex: any) {
@@ -821,7 +842,15 @@ ipcMainProxy.on('k8s-restart', async() => {
 });
 
 ipcMainProxy.on('k8s-versions', async() => {
-  window.send('k8s-versions', await k8smanager.kubeBackend.availableVersions, await k8smanager.kubeBackend.cachedVersionsOnly());
+  try {
+    const versions = await k8smanager.kubeBackend.availableVersions;
+    const cachedOnly = await k8smanager.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
+  } catch (ex) {
+    console.error(`Error handling k8s-versions: ${ ex }`);
+    window.send('k8s-versions', [], true);
+  }
 });
 
 ipcMainProxy.on('k8s-progress', () => {
@@ -842,11 +871,19 @@ ipcMainProxy.handle('service-forward', async(_, service, state) => {
   if (state) {
     const hostPort = service.listenPort ?? 0;
 
-    await k8smanager.kubeBackend.forwardPort(namespace, service.name, service.port, hostPort);
+    await doForwardPort(namespace, service.name, service.port, hostPort);
   } else {
-    await k8smanager.kubeBackend.cancelForward(namespace, service.name, service.port);
+    await doCancelForward(namespace, service.name, service.port);
   }
 });
+
+async function doForwardPort(namespace: string, service: string, k8sPort: string | number, hostPort: number) {
+  return await k8smanager.kubeBackend.forwardPort(namespace, service, k8sPort, hostPort);
+}
+
+async function doCancelForward(namespace: string, service: string, k8sPort: string | number) {
+  return await k8smanager.kubeBackend.cancelForward(namespace, service, k8sPort);
+}
 
 ipcMainProxy.on('k8s-integrations', async() => {
   mainEvents.emit('integration-update', await integrationManager.listIntegrations() ?? {});
@@ -1138,8 +1175,8 @@ function showErrorDialog(title: string, message: string, fatal?: boolean) {
 }
 
 async function handleFailure(payload: any) {
-  let titlePart = 'Error Starting Kubernetes';
-  let message = 'There was an unknown error starting Kubernetes';
+  let titlePart = 'Error Starting Rancher Desktop';
+  let message = 'There was an unknown error starting Rancher Desktop';
   let secondaryMessage = '';
 
   if (payload instanceof K8s.KubernetesError) {
@@ -1159,12 +1196,12 @@ async function handleFailure(payload: any) {
   } else if (payload instanceof Error) {
     secondaryMessage = payload.toString();
   } else if (typeof payload === 'number') {
-    message = `Kubernetes was unable to start with the following exit code: ${ payload }`;
+    message = `Rancher Desktop was unable to start with the following exit code: ${ payload }`;
   } else if ('errorCode' in payload) {
     message = payload.message || message;
     titlePart = payload.context || titlePart;
   }
-  console.log(`Kubernetes was unable to start:`, payload);
+  console.log(`Rancher Desktop was unable to start:`, payload);
   try {
     // getFailureDetails is going to read from existing log files.
     // Wait 1 second before reading them to allow recent writes to appear in them.
@@ -1215,27 +1252,31 @@ function newK8sManager() {
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const mgr = K8sFactory(arch, dockerDirManager);
 
-  mgr.on('state-changed', (state: K8s.State) => {
-    mainEvents.emit('k8s-check-state', mgr);
-    window.send('k8s-check-state', state);
-    if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
-      if (!cfg.kubernetes.version) {
-        writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
-      }
-      currentImageProcessor?.relayNamespaces();
+  mgr.on('state-changed', async(state: K8s.State) => {
+    try {
+      mainEvents.emit('k8s-check-state', mgr);
+      window.send('k8s-check-state', state);
+      if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
+        if (!cfg.kubernetes.version) {
+          writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
+        }
+        currentImageProcessor?.relayNamespaces();
 
-      if (enabledK8s) {
-        Steve.getInstance().start();
+        if (enabledK8s) {
+          await Steve.getInstance().start();
+        }
       }
-    }
 
-    if (state === K8s.State.STOPPING) {
-      Steve.getInstance().stop();
-    }
-    if (pendingRestartContext !== undefined && !backendIsBusy()) {
-      // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
-      setTimeout(doFullRestart, 2_000, pendingRestartContext);
-      pendingRestartContext = undefined;
+      if (state === K8s.State.STOPPING) {
+        Steve.getInstance().stop();
+      }
+      if (pendingRestartContext !== undefined && !backendIsBusy()) {
+        // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
+        setTimeout(doFullRestart, 2_000, pendingRestartContext);
+        pendingRestartContext = undefined;
+      }
+    } catch (ex) {
+      console.error(ex);
     }
   });
 
@@ -1262,7 +1303,10 @@ function newK8sManager() {
   });
 
   mgr.kubeBackend.on('versions-updated', async() => {
-    window.send('k8s-versions', await mgr.kubeBackend.availableVersions, await mgr.kubeBackend.cachedVersionsOnly());
+    const versions = await mgr.kubeBackend.availableVersions;
+    const cachedOnly = await mgr.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
   });
 
   return mgr;
@@ -1352,6 +1396,14 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
 
   factoryReset(keepSystemImages: boolean) {
     doFactoryReset(keepSystemImages);
+  }
+
+  async forwardPort(namespace: string, service: string, k8sPort: string | number, hostPort: number) {
+    return await doForwardPort(namespace, service, k8sPort, hostPort);
+  }
+
+  async cancelForward(namespace: string, service: string, k8sPort: string | number) {
+    return await doCancelForward(namespace, service, k8sPort);
   }
 
   /**
@@ -1477,25 +1529,28 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
 
   async listExtensions() {
     const extensionManager = await getExtensionManager();
-    const extensions = await extensionManager?.getInstalledExtensions() ?? [];
+
+    if (!extensionManager) {
+      return undefined;
+    }
+    const extensions = await extensionManager.getInstalledExtensions();
     const entries = await Promise.all(extensions.map(async x => [x.id, {
       version:  x.version,
       metadata: await x.metadata,
       labels:   await x.labels,
     }] as const));
 
-    return Promise.resolve(Object.fromEntries(entries));
+    return Object.fromEntries(entries);
   }
 
   async installExtension(image: string, state: 'install' | 'uninstall'): Promise<{status: number, data?: any}> {
     const em = await getExtensionManager();
-    const extension = await em?.getExtension(image, { preferInstalled: state === 'uninstall' });
 
-    if (!extension) {
-      console.debug(`Failed to install extension ${ image }: could not get extension.`);
-
-      return { status: 503 };
+    if (!em) {
+      return { status: 503, data: 'Extension manager is not ready yet.' };
     }
+    const extension = await em.getExtension(image, { preferInstalled: state === 'uninstall' });
+
     if (state === 'install') {
       console.debug(`Installing extension ${ image }...`);
       try {
